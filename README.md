@@ -20,14 +20,14 @@ TextVAE/
 ├── requirements.txt
 ├── README.md
 └── models/
-├── **init**.py
-├── gumbel\_softmax.py
-├── vision\_encoder.py
-├── text\_decoder.py
+├── init.py
+├── gumbel_softmax.py
+├── vision_encoder.py
+├── text_decoder.py
 ├── vae.py
 └── diffusion/
-├── **init**.py
-├── diffusion\_decoder.py
+├── init.py
+├── diffusion_decoder.py
 └── unet.py
 
 ````
