@@ -12,11 +12,11 @@ A modular PyTorch implementation of a Variational Auto-Encoder (VAE) that:
 
 ```
 
-text\_vae\_project/
+TextVAE/
 ├── config.py               # Configuration dataclass
-├── datasets.py             # Dummy dataset loader
-├── trainer.py              # Training loop
-├── main.py                 # Entry-point script
+├── datasets.py            # Dummy dataset loader
+├── main.py                # Entry-point script
+├── trainer.py             # Training loop
 ├── requirements.txt
 ├── README.md
 └── models/
@@ -27,8 +27,8 @@ text\_vae\_project/
 ├── vae.py
 └── diffusion/
 ├── **init**.py
-├── unet.py
-└── diffusion\_decoder.py
+├── diffusion\_decoder.py
+└── unet.py
 
 ````
 
@@ -39,8 +39,8 @@ text\_vae\_project/
 ### 1. Clone and install dependencies
 
 ```bash
-git clone https://github.com/your-username/text-vae-diffusion.git
-cd text-vae-diffusion
+git clone https://github.com/GBATZOLIS/TextVAE.git
+cd TextVAE
 pip install -r requirements.txt
 ````
 
@@ -81,4 +81,5 @@ Let me know if you'd like:
 * 🧪 A Colab notebook example
 * ⚙️ GitHub Actions CI/CD config
 * 💾 Model checkpoints or 🤗 Hugging Face integration
+
 
