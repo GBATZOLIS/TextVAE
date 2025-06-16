@@ -1,0 +1,102 @@
+# ------------------------
+# Python cache
+# ------------------------
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+
+# ------------------------
+# Jupyter/IPython
+# ------------------------
+.ipynb_checkpoints/
+*.ipynb
+
+# ------------------------
+# Environments
+# ------------------------
+.env
+.venv/
+env/
+venv/
+*.egg-info/
+*.egg
+.Python
+
+# ------------------------
+# Datasets & Temp Files
+# ------------------------
+data/
+datasets/
+*.lmdb
+*.npy
+*.npz
+*.csv
+*.jsonl
+*.zip
+*.tar.gz
+.cache/
+output/
+
+# ------------------------
+# PyTorch + Lightning
+# ------------------------
+*.pt
+*.pth
+*.ckpt
+lightning_logs/
+checkpoints/
+tb_logs/
+runs/
+logs/
+*.log
+# Lightning checkpoint artifacts
+*.ckpt
+*.last.ckpt
+*.temp.ckpt
+
+# ------------------------
+# Hugging Face
+# ------------------------
+tokenizer_config.json
+special_tokens_map.json
+config.json
+merges.txt
+vocab.json
+pytorch_model.bin
+generation_config.json
+*.safetensors
+hf_cache/
+*.h5
+
+# Transformers cache
+~/.cache/huggingface/
+~/.huggingface/
+
+# Hugging Face Hub download artifacts
+huggingface/transformers/**/*.json
+huggingface/transformers/**/*.bin
+
+# ------------------------
+# VSCode and OS metadata
+# ------------------------
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ------------------------
+# W&B (Weights & Biases)
+# ------------------------
+wandb/
+wandb-debug.log
+wandb-metadata.json
+wandb-summary.json
+
+# ------------------------
+# Optional
+# ------------------------
+*.tmp
+*.bak
+*.swp
+

@@ -1,0 +1,8 @@
+torch>=2.0.0
+torchvision
+transformers>=4.32.0
+einops
+tqdm
+nvidia-ml-py3
+tensorboard
+matplotlib
