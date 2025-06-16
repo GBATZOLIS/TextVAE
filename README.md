@@ -1,13 +1,5 @@
 # Text‑VAE with Diffusion Decoder
 
-A modular PyTorch implementation of a Variational Auto-Encoder (VAE) that:
-
-- Encodes images into a discrete latent space using a Gumbel-Softmax bottleneck.
-- Decodes latents into text via an autoregressive Transformer.
-- Reconstructs images from text using a DDPM-based diffusion model.
-
----
-
 ## 🧱 Project Structure
 
 ```
@@ -64,22 +56,7 @@ python main.py --epochs 10 --batch 8
 
 * Replace `DummyImageDataset` with real data (e.g. ImageNet, CelebA).
 * Add evaluation/metrics (e.g., FID for images, BLEU for text).
-* Support for conditional generation and guided sampling.
 
 ---
-
-## 📜 License
-
-MIT License
-
----
-
-## 🙋‍♂️ Need Help?
-
-Let me know if you'd like:
-
-* 🧪 A Colab notebook example
-* ⚙️ GitHub Actions CI/CD config
-* 💾 Model checkpoints or 🤗 Hugging Face integration
 
 
