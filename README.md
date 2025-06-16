@@ -4,23 +4,24 @@
 
 ```
 
-TextVAE/
-├── config.py               # Configuration dataclass
-├── datasets.py            # Dummy dataset loader
-├── main.py                # Entry-point script
-├── trainer.py             # Training loop
-├── requirements.txt
+.
 ├── README.md
-└── models/
-├── init.py
-├── gumbel_softmax.py
-├── vision_encoder.py
-├── text_decoder.py
-├── vae.py
-└── diffusion/
-├── init.py
-├── diffusion_decoder.py
-└── unet.py
+├── config.py
+├── datasets.py
+├── main.py
+├── models
+│   ├── __init__.py
+│   ├── diffusion
+│   │   ├── __init__.py
+│   │   ├── diffusion_decoder.py
+│   │   └── unet.py
+│   ├── gumbel_softmax.py
+│   ├── text_decoder.py
+│   ├── vae.py
+│   └── vision_encoder.py
+├── requirements.txt
+└── trainer.py
+
 
 ````
 
