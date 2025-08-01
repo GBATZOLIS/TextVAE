@@ -36,6 +36,9 @@ datasets/
 *.jsonl
 *.zip
 *.tar.gz
+*.jpg
+*.jpeg
+*.png
 .cache/
 output/
 
@@ -99,4 +102,3 @@ wandb-summary.json
 *.tmp
 *.bak
 *.swp
-
