@@ -32,6 +32,9 @@ from torch.utils.data import Dataset
 from torchvision.datasets import CelebA
 
 # Set up a logger for this module
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
@@ -140,12 +143,12 @@ if __name__ == "__main__":
         # 2. Get a single sample from the dataset
         sample_image = train_dataset[0]
 
-        # 3. Print information about the sample
-        print(f"\nDataset length (train split): {len(train_dataset)}")
-        print(f"Sample image shape: {sample_image.shape}")
-        print(f"Sample image dtype: {sample_image.dtype}")
-        print(f"Sample image min value: {sample_image.min():.2f}")
-        print(f"Sample image max value: {sample_image.max():.2f}")
+        # 3. Log information about the sample
+        logger.info(f"\nDataset length (train split): {len(train_dataset)}")
+        logger.info(f"Sample image shape: {sample_image.shape}")
+        logger.info(f"Sample image dtype: {sample_image.dtype}")
+        logger.info(f"Sample image min value: {sample_image.min():.2f}")
+        logger.info(f"Sample image max value: {sample_image.max():.2f}")
 
         # Verify the shape is as expected: [Channels, Height, Width]
         assert sample_image.shape == (3, IMAGE_SIZE, IMAGE_SIZE)
