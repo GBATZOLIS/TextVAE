@@ -95,6 +95,7 @@ wandb/
 wandb-debug.log
 wandb-metadata.json
 wandb-summary.json
+**/tests/
 
 # ------------------------
 # Optional
@@ -102,3 +103,4 @@ wandb-summary.json
 *.tmp
 *.bak
 *.swp
+*.txt

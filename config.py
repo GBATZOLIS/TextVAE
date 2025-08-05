@@ -1,55 +1,67 @@
-"""Global configuration dataclass used across the project."""
-from dataclasses import dataclass, field
+# config.py
+
+"""
+Centralized configuration for the End-to-End Swin-based Text-Conditioned VAE.
+"""
+import logging
+from dataclasses import dataclass
+
+# Set up a logger for this module
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class VAEConfig:
-    # ---------- image ----------
-    image_size: int = 256
-    image_channels: int = 3
-    patch_size: int = 16
+    """Configuration for the End-to-End Swin-based VAE."""
 
-    # ---------- encoder ----------
-    encoder_dim: int = 768
-    encoder_depth: int = 12
-    encoder_heads: int = 12
-    encoder_mlp_dim: int = 3072
-    encoder_dropout: float = 0.1
+    # --- Model Architecture ---
+    vision_encoder_model: str = "microsoft/swin-base-patch4-window7-224"
+    llm_prior_model: str = "gpt2"
 
-    # ---------- text decoder ----------
+    # --- Text Decoder Specifics ---
     text_decoder_dim: int = 768
-    text_decoder_depth: int = 6
     text_decoder_heads: int = 12
+    text_decoder_depth: int = 12
     text_decoder_mlp_dim: int = 3072
-    text_decoder_dropout: float = 0.1
     max_text_length: int = 77
-    vocab_size: int = 50257  # GPT‑2 vocab size
 
-    # ---------- gumbel softmax ----------
-    gumbel_temperature: float = 1.0
-    gumbel_temperature_min: float = 0.1
-    gumbel_anneal_rate: float = 3e-5
-    use_straight_through: bool = True
-
-    # ---------- diffusion ----------
+    # --- Custom Diffusion Decoder ---
     diffusion_timesteps: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 0.02
 
-    # ---------- optimisation ----------
-    kl_weight: float = 0.1
-    learning_rate: float = 1e-4
-    batch_size: int = 16
-    gradient_accumulation_steps: int = 1
-    amp: bool = True  # Automatic mixed precision
-
-    # ---------- LLM prior ----------
-    llm_model_name: str = "gpt2"
-    freeze_llm: bool = True
-
-    # ---------- misc ----------
+    # --- Training Hyperparameters ---
+    epochs: int = 150
+    batch_size: int = 4
+    learning_rate: float = 5e-5
+    kl_weight: float = 1e-4
     seed: int = 42
-    log_every: int = 100
-    save_every_epochs: int = 5
+    use_amp: bool = True
+    work_dir: str = "./runs_swin_end_to_end"
+    save_every_n_steps: int = 1000
 
-    # Dynamically tracked fields (do not set manually)
-    global_step: int = field(default=0, init=False)
+    # --- Gumbel-Softmax Configuration ---
+    gumbel_temperature: float = 1.0
+    gumbel_anneal_rate: float = 1e-6
+    gumbel_temperature_min: float = 0.1
+    use_straight_through: bool = True
+
+    # --- Dataset and Image Configuration ---
+    image_size: int = 224
+    image_channels: int = 3
+    dataset_path: str = "~/datasets"
+
+    # --- Operational Flags ---
+    freeze_vision_encoder: bool = False
+    freeze_llm_prior: bool = True
+    freeze_diffusion_decoder: bool = False
+
+    def __post_init__(self):
+        """Log the configuration after initialization."""
+        logger.info("--- VAE Swin End-to-End Configuration ---")
+        for key, value in self.__dict__.items():
+            logger.info(f"{key}: {value}")
+        logger.info("-----------------------------------------")

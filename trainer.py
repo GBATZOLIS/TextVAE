@@ -1,22 +1,21 @@
 # trainer.py
 
-"""Training harness for TextVAE (supports AMP & gradient accumulation)."""
-from __future__ import annotations
+"""
+Contains the training and validation logic for the Text-Conditioned VAE.
+This version includes robust KL annealing and gradient clipping to prevent
+mode collapse and stabilize training.
+"""
 import logging
-from pathlib import Path
-from typing import Dict, List, cast
-import tempfile
 import torch
-from torch.amp import GradScaler, autocast
-import torchvision.utils as vutils
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch_fidelity import calculate_metrics
-from config import VAEConfig
-from models import build_vae_from_config
-from tqdm.auto import tqdm
+from torch.amp import GradScaler, autocast
+from torch.optim import AdamW
+from tqdm import tqdm
+from pathlib import Path
 
-# Set up a logger for this module
+from config import VAEConfig
+from models.vae import TextVAE
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
@@ -24,233 +23,160 @@ logger = logging.getLogger(__name__)
 
 
 class TextVAETrainer:
-    """
-    Manages the training and validation loop for the TextVAE model.
+    """Manages the training loops, checkpointing, and recovery."""
 
-    Handles device placement, optimization, learning rate scheduling,
-    gradient accumulation, automatic mixed precision (AMP), and checkpointing.
-
-    Args:
-        cfg (VAE_config): The configuration object for the model and training.
-        work_dir (str): Directory to save checkpoints and logs.
-    """
-
-    def __init__(self, cfg: VAEConfig, work_dir: str = "./runs"):
+    def __init__(self, cfg: VAEConfig, work_dir: str):
         self.cfg = cfg
         self.work_dir = Path(work_dir)
-        self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.work_dir.mkdir(exist_ok=True, parents=True)
 
-        # --- Device Setup ---
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda")
-            logger.info("CUDA is available. Training on GPU.")
-        else:
-            self.device = torch.device("cpu")
-            logger.warning(
-                "CUDA not available. Training on CPU. This will be very slow."
-            )
-            # AMP is only for CUDA
-            if self.cfg.amp:
-                logger.warning(
-                    "AMP is enabled but CUDA is not available. Disabling AMP."
-                )
-                self.cfg.amp = False
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Using device: {self.device}")
 
-        # --- Model, Optimizer, and Scaler ---
-        self.model = build_vae_from_config(cfg).to(self.device)
-        self.opt = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=cfg.learning_rate,
-            betas=(0.9, 0.999),
-            weight_decay=1e-2,
-        )
-        # GradScaler is used for stable gradients with float16 training (AMP).
-        self.scaler = GradScaler(device=self.device.type, enabled=self.cfg.amp)
+        self.model = TextVAE(cfg).to(self.device)
 
-        self.global_step = 0
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         logger.info(
-            f"Trainer initialized. Checkpoints will be saved to {self.work_dir}"
+            f"Number of trainable parameters: {sum(p.numel() for p in trainable_params) / 1e6:.2f}M"
         )
+        self.optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+        self.scaler = GradScaler(device=self.device_type, enabled=cfg.use_amp)
 
-    def _run_step(self, batch: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Runs a single forward pass and returns the model output."""
-        batch = batch.to(self.device)
-        # autocast enables automatic mixed precision for the forward pass.
-        # Operations are run in float16 where safe, and float32 otherwise.
-        with autocast(device_type=self.device.type, enabled=self.cfg.amp):
-            model_output = self.model(batch)
-            assert isinstance(
-                model_output, dict
-            ), f"Expected model output to be a dict, but got {type(model_output)}"
+        self.epoch = 0
+        self.global_step = 0
+        self.best_val_loss = float("inf")
 
-            out = cast(Dict[str, torch.Tensor], model_output)
-            return out
+        # --- KL Annealing Schedule Parameters ---
+        # These can be tuned in your config file if needed
+        self.kl_anneal_warmup_steps = 5000  # Steps with kl_weight = 0
+        self.kl_anneal_total_steps = 25000  # Total steps to reach full kl_weight
 
-    def fit(
-        self,
-        train_loader: DataLoader,
-        val_loader: DataLoader | None = None,
-        epochs: int = 10,
-    ):
-        """
-        The main training loop.
+    def get_current_kl_weight(self) -> float:
+        """Calculates the KL weight for the current step based on the annealing schedule."""
+        if self.global_step < self.kl_anneal_warmup_steps:
+            return 0.0
 
-        Args:
-            train_loader (DataLoader): DataLoader for the training set.
-            val_loader (DataLoader, optional): DataLoader for the validation set.
-            epochs (int): Number of epochs to train for.
-        """
-        logger.info(f"Starting training for {epochs} epochs.")
-        for epoch in range(1, epochs + 1):
-            self.model.train()
-            # Use tqdm for a progress bar over the training loader.
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [Training]")
-            for i, batch in enumerate(pbar):
-                # --- Gradient Accumulation Loop ---
-                # The actual forward and backward pass.
-                out = self._run_step(batch)
-                loss = out["loss"]
-
-                # Scale the loss for gradient accumulation.
-                # This ensures the final accumulated gradient has the correct magnitude.
-                scaled_loss = self.scaler.scale(
-                    loss / self.cfg.gradient_accumulation_steps
-                )
-                scaled_loss.backward()
-
-                # --- Optimizer Step ---
-                # Step the optimizer only after accumulating enough gradients.
-                if (i + 1) % self.cfg.gradient_accumulation_steps == 0:
-                    self.scaler.step(self.opt)
-                    self.scaler.update()
-                    self.opt.zero_grad(set_to_none=True)  # More memory efficient
-                    self.global_step += 1
-
-                # Logging
-                if self.global_step % self.cfg.log_every == 0:
-                    metrics = {k: f"{v.item():.4f}" for k, v in out.items()}
-                    pbar.set_postfix(metrics)
-
-            # --- End of Epoch ---
-            if val_loader:
-                self.validate(val_loader, epoch)
-
-            if epoch % self.cfg.save_every_epochs == 0:
-                self.save_checkpoint(f"epoch_{epoch}.pt")
-
-        logger.info("Training finished.")
-
-    @torch.no_grad()
-    def validate(self, val_loader: DataLoader, epoch: int):
-        """
-        Runs a full validation loop, generating images and calculating
-        FID and Perplexity metrics.
-        """
-        self.model.eval()
-        logger.info(f"Running validation for epoch {epoch} with metrics...")
-
-        all_ppl: List[float] = []
-
-        # Create temporary directories to store real and generated images for FID
-        with tempfile.TemporaryDirectory() as real_dir, tempfile.TemporaryDirectory() as fake_dir:
-            real_path = Path(real_dir)
-            fake_path = Path(fake_dir)
-            pbar = tqdm(val_loader, desc=f"Epoch {epoch} [Generating for Metrics]")
-            img_idx = 0
-
-            for batch in pbar:
-                batch = batch.to(self.device)
-
-                # --- Generate tokens and images ---
-                # 1. Encode image to get generated tokens
-                enc_out = self.model.encode(batch, sample=True)
-                hard_tokens = enc_out["hard_tokens"]
-                assert hard_tokens is not None
-
-                # 2. Decode the generated tokens back to an image
-                generated_images = self.model.decode(hard_tokens)
-
-                # --- Calculate Perplexity ---
-                # Get the LLM's predictions for the generated tokens
-                with torch.no_grad():
-                    lm_out = self.model.llm(input_ids=hard_tokens)
-                    lm_logits = lm_out.last_hidden_state
-
-                # Calculate cross-entropy loss against the LLM's own predictions
-                # Shift logits to align with labels for next-token prediction
-                shift_logits = lm_logits[..., :-1, :].contiguous()
-                shift_labels = hard_tokens[..., 1:].contiguous()
-
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-                )
-                perplexity = torch.exp(loss)
-                all_ppl.append(perplexity.item())
-
-                # --- Save images for FID calculation ---
-                for i in range(batch.size(0)):
-                    vutils.save_image(
-                        batch[i], real_path / f"{img_idx}.png", normalize=True
-                    )
-                    vutils.save_image(
-                        generated_images[i],
-                        fake_path / f"{img_idx}.png",
-                        normalize=True,
-                    )
-                    img_idx += 1
-
-            # --- Calculate FID Score ---
-            logger.info("Calculating FID score... (this may take a moment)")
-            # Set isc=False, fid=True, kid=False as we only need FID
-            metrics_dict = calculate_metrics(
-                str(fake_path),
-                str(real_path),
-                cuda=True,
-                isc=False,
-                fid=True,
-                kid=False,
-                verbose=False,
-            )
-            fid_score = metrics_dict.get("frechet_inception_distance", float("nan"))
-
-        # --- Log final metrics ---
-        avg_perplexity = sum(all_ppl) / len(all_ppl) if all_ppl else float("nan")
-        log_str = (
-            f"Validation Results Epoch {epoch} - "
-            f"FID: {fid_score:.4f} | "
-            f"Perplexity: {avg_perplexity:.4f}"
+        # Linearly increase the weight from 0 to the target cfg.kl_weight
+        progress = (self.global_step - self.kl_anneal_warmup_steps) / (
+            self.kl_anneal_total_steps - self.kl_anneal_warmup_steps
         )
-        logger.info(log_str)
+        current_weight = min(1.0, progress) * self.cfg.kl_weight
+        return current_weight
 
-    def save_checkpoint(self, name: str):
-        """
-        Saves the model and optimizer state to a file.
-
-        Args:
-            name (str): The name for the checkpoint file.
-        """
-        path = self.work_dir / name
-        logger.info(f"Saving checkpoint to {path}")
-        ckpt = {
-            "model": self.model.state_dict(),
-            "opt": self.opt.state_dict(),
-            "scaler": self.scaler.state_dict(),
-            "cfg": self.cfg,
-            "global_step": self.global_step,
-        }
-        torch.save(ckpt, path)
-
-    def load_checkpoint(self, path: str | Path):
+    def load_checkpoint(self, path: str):
         """Loads a checkpoint to resume training."""
-        path = Path(path)
-        if not path.exists():
-            logger.error(f"Checkpoint not found at {path}")
-            return
+        try:
+            checkpoint = torch.load(
+                path, map_location=self.device, weights_only=False
+            )  # Allow loading config
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+            self.epoch = checkpoint["epoch"] + 1
+            self.global_step = checkpoint["global_step"]
+            self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+            logger.info(
+                f"Resumed training from epoch {self.epoch} at step {self.global_step}."
+            )
+        except Exception as e:
+            logger.error(
+                f"Could not load checkpoint due to error: {e}. Starting from scratch."
+            )
 
-        logger.info(f"Loading checkpoint from {path}")
-        ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model"])
-        self.opt.load_state_dict(ckpt["opt"])
-        self.scaler.load_state_dict(ckpt["scaler"])
-        self.global_step = ckpt["global_step"]
-        logger.info(f"Resumed training from global step {self.global_step}")
+    def save_checkpoint(self, filename: str):
+        """Saves a model checkpoint."""
+        checkpoint_path = self.work_dir / filename
+        checkpoint = {
+            "model_state_dict": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "epoch": self.epoch,
+            "global_step": self.global_step,
+            "best_val_loss": self.best_val_loss,
+            "config": self.cfg,
+        }
+        torch.save(checkpoint, checkpoint_path)
+        logger.info(f"Checkpoint saved to {checkpoint_path}")
+
+    def _run_epoch(self, dataloader: DataLoader, is_training: bool) -> float:
+        """Runs a single epoch and returns the average loss."""
+        self.model.train(is_training)
+        progress_bar = tqdm(
+            dataloader,
+            desc=f"Epoch {self.epoch+1}/{self.cfg.epochs} [{'Train' if is_training else 'Valid'}]",
+        )
+        total_loss, total_recon, total_kl = 0.0, 0.0, 0.0
+
+        for batch in progress_bar:
+            images = batch[0] if isinstance(batch, (list, tuple)) else batch
+            images = images.to(self.device)
+
+            with torch.set_grad_enabled(is_training):
+                with autocast(device_type=self.device_type, enabled=self.cfg.use_amp):
+                    losses = self.model(images)
+
+                    # FIX: Apply the KL annealing schedule during training
+                    current_kl_weight = (
+                        self.get_current_kl_weight()
+                        if is_training
+                        else self.cfg.kl_weight
+                    )
+                    loss = losses["recon"] + current_kl_weight * losses["kl"]
+
+            if is_training:
+                self.optimizer.zero_grad(set_to_none=True)
+                self.scaler.scale(loss).backward()
+
+                # FIX: Add gradient clipping for stability
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.global_step += 1
+
+                if (
+                    self.global_step > 0
+                    and self.global_step % self.cfg.save_every_n_steps == 0
+                ):
+                    self.save_checkpoint(filename=f"step_{self.global_step}.pt")
+
+            total_loss += loss.item()  # Log the combined loss
+            total_recon += losses["recon"].item()
+            total_kl += losses["kl"].item()
+            progress_bar.set_postfix(
+                {
+                    "Loss": f"{loss.item():.4f}",
+                    "Recon": f"{losses['recon'].item():.4f}",
+                    "KL": f"{losses['kl'].item():.4f}",
+                    "KL_W": f"{current_kl_weight:.6f}",
+                }
+            )
+
+        avg_loss = total_loss / len(dataloader)
+        logger.info(
+            f"Epoch {self.epoch+1} Avg {'Train' if is_training else 'Valid'} Loss: {avg_loss:.4f}"
+        )
+        return avg_loss
+
+    def fit(self, train_loader: DataLoader, val_loader: DataLoader):
+        """The main training loop."""
+        logger.info("--- Starting End-to-End Training with Swin Transformer ---")
+        if self.epoch == 0:
+            self.save_checkpoint(filename="initial_model.pt")
+
+        for epoch in range(self.epoch, self.cfg.epochs):
+            self.epoch = epoch
+            self._run_epoch(train_loader, is_training=True)
+
+            with torch.no_grad():
+                val_loss = self._run_epoch(val_loader, is_training=False)
+
+            self.save_checkpoint(filename=f"epoch_{self.epoch+1}.pt")
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                logger.info(
+                    f"New best validation loss: {self.best_val_loss:.4f}. Saving best model."
+                )
+                self.save_checkpoint(filename="best_model.pt")
+
+        logger.info(f"--- Training Finished after {self.cfg.epochs} epochs ---")

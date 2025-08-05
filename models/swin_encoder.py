@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import logging
-from swin_transformer_v2 import PatchEmbed, BasicLayer
+from .swin_transformer_v2 import PatchEmbed, BasicLayer
 from config import VAEConfig  # Your config object
 
 logging.basicConfig(
