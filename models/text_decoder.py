@@ -1,12 +1,18 @@
 # models/text_decoder.py
 
-"""Autoregressive text decoder with cross-attention to vision features."""
+"""
+Autoregressive text decoder with cross-attention to vision features.
+This version is adapted to work with features from a CLIP vision encoder
+and includes placeholders for KV caching for efficient inference.
+"""
 from __future__ import annotations
 import logging
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from config import VAEConfig
-from .vision_encoder import TransformerBlock
 
 # Set up a logger for this module
 logging.basicConfig(
@@ -15,117 +21,151 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class TextDecoder(nn.Module):
+class DecoderAttention(nn.Module):
     """
-    An autoregressive Transformer-based text decoder.
-
-    It generates text tokens one by one, conditioned on image features via
-    cross-attention.
-
-    Args:
-        cfg (VAEConfig): Configuration object with model parameters.
+    A more robust Multi-Head Attention module for the TextDecoder.
+    It uses PyTorch 2.0's fused `scaled_dot_product_attention` for performance.
     """
+
+    def __init__(self, dim: int, heads: int):
+        super().__init__()
+        self.heads = heads
+        self.scale = (dim // heads) ** -0.5
+        self.to_q = nn.Linear(dim, dim, bias=False)
+        self.to_k = nn.Linear(dim, dim, bias=False)
+        self.to_v = nn.Linear(dim, dim, bias=False)
+        self.to_out = nn.Linear(dim, dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+        is_causal: bool = False,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+
+        kv_input = context if context is not None else x
+
+        q = self.to_q(x)
+        k = self.to_k(kv_input)
+        v = self.to_v(kv_input)
+
+        # Handle KV caching for fast autoregressive generation
+        if kv_cache is not None:
+            past_k, past_v = kv_cache
+            k = torch.cat((past_k, k), dim=1)
+            v = torch.cat((past_v, v), dim=1)
+
+        # Use PyTorch's optimized attention implementation
+        out = (
+            F.scaled_dot_product_attention(
+                q.view(q.shape[0], q.shape[1], self.heads, -1).transpose(1, 2),
+                k.view(k.shape[0], k.shape[1], self.heads, -1).transpose(1, 2),
+                v.view(v.shape[0], v.shape[1], self.heads, -1).transpose(1, 2),
+                is_causal=is_causal,
+            )
+            .transpose(1, 2)
+            .reshape(q.shape)
+        )
+
+        return self.to_out(out), (k, v)
+
+
+class DecoderBlock(nn.Module):
+    """A single Transformer block for the TextDecoder."""
 
     def __init__(self, cfg: VAEConfig):
         super().__init__()
+        self.norm1 = nn.LayerNorm(cfg.text_decoder_dim)
+        self.attn1 = DecoderAttention(cfg.text_decoder_dim, cfg.text_decoder_heads)
+
+        self.norm2 = nn.LayerNorm(cfg.text_decoder_dim)
+        self.attn2 = DecoderAttention(cfg.text_decoder_dim, cfg.text_decoder_heads)
+
+        self.norm3 = nn.LayerNorm(cfg.text_decoder_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(cfg.text_decoder_dim, cfg.text_decoder_mlp_dim),
+            nn.GELU(),
+            nn.Linear(cfg.text_decoder_mlp_dim, cfg.text_decoder_dim),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+
+        # Self-attention (causal)
+        attn_out, self_kv = self.attn1(self.norm1(x), is_causal=True, kv_cache=kv_cache)
+        x = x + attn_out
+
+        # Cross-attention to image features
+        cross_out, _ = self.attn2(self.norm2(x), context=context)
+        x = x + cross_out
+
+        # Feed-forward
+        x = x + self.mlp(self.norm3(x))
+
+        return x, self_kv
+
+
+class TextDecoder(nn.Module):
+    """
+    Autoregressive Transformer decoder to generate text from image features.
+    """
+
+    def __init__(
+        self, cfg: VAEConfig, token_embedding_layer: nn.Embedding, vocab_size: int
+    ):
+        super().__init__()
         self.cfg = cfg
-        self.token_emb = nn.Embedding(cfg.vocab_size, cfg.text_decoder_dim)
-        # Positional embeddings are learned parameters.
+        # Share token embeddings with the LLM prior for a consistent space
+        self.token_emb = token_embedding_layer
+
         self.pos_emb = nn.Parameter(
             torch.zeros(1, cfg.max_text_length, cfg.text_decoder_dim)
         )
-        self.blocks = nn.ModuleList(
-            # Each block has self-attention and cross-attention to image features.
-            [
-                TransformerBlock(cfg, cross_attention=True)
-                for _ in range(cfg.text_decoder_depth)
-            ]
-        )
-        self.norm = nn.LayerNorm(cfg.text_decoder_dim)
-        # The final linear layer to project back to the vocabulary size.
-        self.lm_head = nn.Linear(cfg.text_decoder_dim, cfg.vocab_size, bias=False)
 
-        # Initialize positional embeddings.
+        self.blocks = nn.ModuleList(
+            [DecoderBlock(cfg) for _ in range(cfg.text_decoder_depth)]
+        )
+
+        self.norm = nn.LayerNorm(cfg.text_decoder_dim)
+        # The final head projects back to the vocabulary size.
+        # FIX: Use the vocab_size passed in from the loaded model, not from the config string.
+        self.lm_head = nn.Linear(cfg.text_decoder_dim, vocab_size, bias=False)
+
         nn.init.trunc_normal_(self.pos_emb, std=0.02)
         logger.info(f"TextDecoder initialized with {cfg.text_decoder_depth} blocks.")
 
-    @staticmethod
-    def causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
-        """
-        Creates a causal mask to prevent attention to future tokens.
-
-        For a sequence of length `seq_len`, returns a `[seq_len, seq_len]`
-        lower-triangular matrix of booleans.
-        """
-        # torch.tril creates the lower-triangular matrix.
-        mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).bool()
-        # Add batch and head dimensions for broadcasting: [1, 1, seq_len, seq_len]
-        return mask[None, None, :, :]
-
     def forward(
-        self, tokens: torch.Tensor, image_feats: torch.Tensor, use_cache: bool = False
-    ) -> torch.Tensor:
-        """
-        Forward pass of the text decoder.
+        self,
+        tokens: torch.Tensor,
+        image_feats: torch.Tensor,
+        use_cache: bool = False,
+        past_key_values: Optional[list] = None,
+    ) -> Tuple[torch.Tensor, list]:
 
-        Args:
-            tokens (torch.Tensor): Input text tokens (either hard or soft).
-                                   Shape: [B, T] or [B, T, V].
-            image_feats (torch.Tensor): Conditioning image features from the vision encoder.
-                                        Shape: [B, N, D].
-            use_cache (bool): If True, enables key-value caching for faster generation.
-                              NOTE: This feature is not implemented in the original code.
-                              Implementing it would significantly speed up autoregressive sampling.
+        B, T = tokens.shape
 
-        Returns:
-            torch.Tensor: Logits over the vocabulary. Shape: [B, T, vocab_size].
-        """
-        B, T = tokens.shape[:2]
-
-        # --- BUG/IMPROVEMENT NOTE ---
-        if use_cache:
-            logger.warning(
-                "`use_cache=True` was passed, but KV caching is not implemented. "
-                "Performance for autoregressive generation will be suboptimal."
-            )
-
-        # Ensure sequence length does not exceed positional embedding size.
         if T > self.cfg.max_text_length:
             raise ValueError(
-                f"Input sequence length ({T}) exceeds maximum configured length "
-                f"({self.cfg.max_text_length})."
+                f"Sequence length {T} exceeds max {self.cfg.max_text_length}"
             )
 
-        logger.debug(
-            f"TextDecoder input shapes - tokens: {tokens.shape}, image_feats: {image_feats.shape}"
-        )
-
-        # 1. Embed tokens.
-        # The input 'tokens' can be one of three things. We need to handle each case.
-        if tokens.dim() == 2:
-            # Case 1: Hard tokens (indices) -> Embed them.
-            x = self.token_emb(tokens)
-        elif tokens.shape[-1] == self.cfg.vocab_size:
-            # Case 2: Soft tokens (probabilities) -> Embed via matmul.
-            x = torch.matmul(tokens, self.token_emb.weight)
-        else:
-            # Case 3: Already embedded tokens -> Use them directly.
-            # This is the case during the autoregressive generation loop.
-            x = tokens
-
-        # 2. Add positional embeddings.
+        x = self.token_emb(tokens)
         x = x + self.pos_emb[:, :T]
 
-        # 3. Create causal mask for self-attention.
-        mask = self.causal_mask(T, tokens.device)
+        new_kv_caches = []
+        for i, blk in enumerate(self.blocks):
+            # Pass the corresponding cache to each block
+            kv_cache = past_key_values[i] if use_cache and past_key_values else None
+            x, new_kv = blk(x, context=image_feats, kv_cache=kv_cache)
+            if use_cache:
+                new_kv_caches.append(new_kv)
 
-        # 4. Pass through Transformer blocks.
-        for blk in self.blocks:
-            x = blk(x, context=image_feats, mask=mask)
-
-        # 5. Final normalization and projection to vocabulary.
         x = self.norm(x)
         logits = self.lm_head(x)
-        logger.debug(f"TextDecoder output logits shape: {logits.shape}")
 
-        return logits
+        return logits, new_kv_caches
