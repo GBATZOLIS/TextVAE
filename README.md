@@ -11,12 +11,7 @@
 ├── main.py
 ├── models
 │   ├── __init__.py
-│   ├── diffusion
-│   │   ├── __init__.py
-│   │   ├── diffusion_decoder.py
-│   │   └── unet.py
-│   ├── gumbel_softmax.py
-│   ├── text_decoder.py
+│   ├── diffusion_decoder.py
 │   ├── vae.py
 │   └── vision_encoder.py
 ├── requirements.txt
@@ -59,5 +54,3 @@ python main.py --epochs 10 --batch 8
 * Add evaluation/metrics (e.g., FID for images, BLEU for text).
 
 ---
-
-
