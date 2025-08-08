@@ -6,7 +6,6 @@ import torch
 import torchvision.transforms as T
 from torch.utils.data import Dataset
 from torchvision.datasets import CelebA
-from PIL import Image
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -30,8 +29,8 @@ class ImageDataset(Dataset):
                 T.Resize((image_size, image_size)),
                 T.CenterCrop((image_size, image_size)),
                 T.ToTensor(),
-                # Normalization for SDXL VAE
-                T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                # REMOVED THIS LINE:
+                # T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ]
         )
 
@@ -52,8 +51,8 @@ class ImageDataset(Dataset):
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, Image.Image]:
+    def __getitem__(self, idx: int) -> torch.Tensor:
         image_pil, _ = self.dataset[idx]
         image_tensor = self.transform(image_pil)
-        # We return the PIL image as well for the Canny detector
-        return image_tensor, image_pil
+        # The PIL image is no longer needed, so we only return the tensor
+        return image_tensor
