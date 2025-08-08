@@ -1,182 +1,170 @@
 # trainer.py
-
-"""
-Contains the training and validation logic for the Text-Conditioned VAE.
-This version includes robust KL annealing and gradient clipping to prevent
-mode collapse and stabilize training.
-"""
 import logging
-import torch
-from torch.utils.data import DataLoader
-from torch.amp import GradScaler, autocast
-from torch.optim import AdamW
-from tqdm import tqdm
 from pathlib import Path
 
-from config import VAEConfig
-from models.vae import TextVAE
+import torch
+import wandb
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-)
+from config import ProjectConfig
+from dataset import ImageDataset
+from models.plausibility import PlausibilityModule
+
 logger = logging.getLogger(__name__)
 
 
-class TextVAETrainer:
-    """Manages the training loops, checkpointing, and recovery."""
+class Trainer:
+    """
+    Handles the training process using the DeepSpeed engine.
+    """
 
-    def __init__(self, cfg: VAEConfig, work_dir: str):
-        self.cfg = cfg
-        self.work_dir = Path(work_dir)
-        self.work_dir.mkdir(exist_ok=True, parents=True)
+    def __init__(self, config: ProjectConfig, model_engine, train_dataloader):
+        self.config = config
+        self.model_engine = model_engine
+        self.train_dataloader = train_dataloader
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device_type = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Using device: {self.device}")
-
-        self.model = TextVAE(cfg).to(self.device)
-
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        logger.info(
-            f"Number of trainable parameters: {sum(p.numel() for p in trainable_params) / 1e6:.2f}M"
-        )
-        self.optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
-        self.scaler = GradScaler(device=self.device_type, enabled=cfg.use_amp)
-
-        self.epoch = 0
-        self.global_step = 0
         self.best_val_loss = float("inf")
+        self.global_step = self.model_engine.global_steps  # Use DeepSpeed's global step
 
-        # --- KL Annealing Schedule Parameters ---
-        # These can be tuned in your config file if needed
-        self.kl_anneal_warmup_steps = 5000  # Steps with kl_weight = 0
-        self.kl_anneal_total_steps = 25000  # Total steps to reach full kl_weight
+        if self.config.logging.use_wandb:
+            wandb.init(
+                project=self.config.logging.project_name,
+                name=self.config.logging.run_name,
+                config=vars(config),
+            )
+            wandb.watch(self.model_engine, log="all")
 
-    def get_current_kl_weight(self) -> float:
-        """Calculates the KL weight for the current step based on the annealing schedule."""
-        if self.global_step < self.kl_anneal_warmup_steps:
-            return 0.0
+        self._setup_validation_loader()
 
-        # Linearly increase the weight from 0 to the target cfg.kl_weight
-        progress = (self.global_step - self.kl_anneal_warmup_steps) / (
-            self.kl_anneal_total_steps - self.kl_anneal_warmup_steps
-        )
-        current_weight = min(1.0, progress) * self.cfg.kl_weight
-        return current_weight
+        # The plausibility module is not trained, so we manage it separately
+        self.plausibility_module = PlausibilityModule(
+            model_name=self.config.models.plausibility_module_name
+        ).to(self.model_engine.device)
 
-    def load_checkpoint(self, path: str):
-        """Loads a checkpoint to resume training."""
+    def _setup_validation_loader(self):
+        """Initializes the validation dataloader."""
+        # This re-uses the training dataset object but with a different split logic
+        # For simplicity, we'll create a new dataset object for validation
         try:
-            checkpoint = torch.load(
-                path, map_location=self.device, weights_only=False
-            )  # Allow loading config
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
-            self.epoch = checkpoint["epoch"] + 1
-            self.global_step = checkpoint["global_step"]
-            self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+            full_dataset = ImageDataset(
+                root=self.config.data.data_dir, image_size=self.config.data.image_size
+            )
+            train_size = int(0.9 * len(full_dataset))
+            val_size = len(full_dataset) - train_size
+            generator = torch.Generator().manual_seed(42)
+            _, val_dataset = torch.utils.data.random_split(
+                full_dataset, [train_size, val_size], generator=generator
+            )
+
+            self.valid_dataloader = DataLoader(
+                val_dataset,
+                batch_size=self.config.training.batch_size,
+                shuffle=False,
+                num_workers=4,
+                pin_memory=True,
+            )
             logger.info(
-                f"Resumed training from epoch {self.epoch} at step {self.global_step}."
+                f"Validation Dataloader created with {len(val_dataset)} samples."
             )
-        except Exception as e:
-            logger.error(
-                f"Could not load checkpoint due to error: {e}. Starting from scratch."
+        except FileNotFoundError:
+            logger.warning(
+                "Could not create validation loader, validation will be skipped."
             )
+            self.valid_dataloader = None
 
-    def save_checkpoint(self, filename: str):
-        """Saves a model checkpoint."""
-        checkpoint_path = self.work_dir / filename
-        checkpoint = {
-            "model_state_dict": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "epoch": self.epoch,
-            "global_step": self.global_step,
-            "best_val_loss": self.best_val_loss,
-            "config": self.cfg,
-        }
-        torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Checkpoint saved to {checkpoint_path}")
+    def _run_validation(self):
+        """Performs a full validation run."""
+        if self.valid_dataloader is None:
+            return {"val_loss": -1.0}
 
-    def _run_epoch(self, dataloader: DataLoader, is_training: bool) -> float:
-        """Runs a single epoch and returns the average loss."""
-        self.model.train(is_training)
-        progress_bar = tqdm(
-            dataloader,
-            desc=f"Epoch {self.epoch+1}/{self.cfg.epochs} [{'Train' if is_training else 'Valid'}]",
+        self.model_engine.eval()
+        total_val_loss = 0.0
+
+        with torch.no_grad():
+            pbar = tqdm(self.valid_dataloader, desc="Validating", leave=False)
+            for batch in pbar:
+                original_images = batch.to(self.model_engine.device, dtype=torch.half)
+
+                generated_logits, _, loss_recon = self.model_engine(original_images)
+                loss_plausibility = self.plausibility_module(generated_logits)
+
+                total_loss = (
+                    loss_recon
+                    + self.config.training.lambda_plausibility * loss_plausibility
+                )
+                total_val_loss += total_loss.item()
+
+        avg_val_loss = total_val_loss / len(self.valid_dataloader)
+        return {"val_loss": avg_val_loss}
+
+    def save_checkpoint(self, is_best=False):
+        """Saves a DeepSpeed checkpoint."""
+        tag = f"step_{self.global_step}"
+        checkpoint_dir = Path(self.config.logging.checkpoint_dir)
+        self.model_engine.save_checkpoint(checkpoint_dir, tag=tag)
+        logger.info(
+            f"Saved DeepSpeed checkpoint for step {self.global_step} to {checkpoint_dir}/{tag}"
         )
-        total_loss, total_recon, total_kl = 0.0, 0.0, 0.0
+        if is_best:
+            # You can add logic here to copy the best checkpoint if desired
+            logger.info("New best model checkpoint saved.")
 
-        for batch in progress_bar:
-            images = batch[0] if isinstance(batch, (list, tuple)) else batch
-            images = images.to(self.device)
+    def load_checkpoint(self, checkpoint_path):
+        """Loads a DeepSpeed checkpoint."""
+        _, client_sd = self.model_engine.load_checkpoint(checkpoint_path)
+        self.global_step = client_sd.get("global_steps", 0)
+        logger.info(
+            f"Loaded checkpoint from {checkpoint_path} at global step {self.global_step}"
+        )
 
-            with torch.set_grad_enabled(is_training):
-                with autocast(device_type=self.device_type, enabled=self.cfg.use_amp):
-                    losses = self.model(images)
+    def train(self):
+        """The main training loop, driven by the DeepSpeed engine."""
+        logger.info("Starting training...")
+        for epoch in range(self.config.training.epochs):
+            self.model_engine.train()
+            pbar = tqdm(
+                self.train_dataloader,
+                desc=f"Epoch {epoch + 1}/{self.config.training.epochs}",
+            )
+            for batch in pbar:
+                original_images = batch.to(self.model_engine.device, dtype=torch.half)
 
-                    # FIX: Apply the KL annealing schedule during training
-                    current_kl_weight = (
-                        self.get_current_kl_weight()
-                        if is_training
-                        else self.cfg.kl_weight
-                    )
-                    loss = losses["recon"] + current_kl_weight * losses["kl"]
+                generated_logits, _, loss_recon = self.model_engine(original_images)
+                loss_plausibility = self.plausibility_module(generated_logits.detach())
+                total_loss = (
+                    loss_recon
+                    + self.config.training.lambda_plausibility * loss_plausibility
+                )
 
-            if is_training:
-                self.optimizer.zero_grad(set_to_none=True)
-                self.scaler.scale(loss).backward()
+                self.model_engine.backward(total_loss)
+                self.model_engine.step()
 
-                # FIX: Add gradient clipping for stability
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.global_step = self.model_engine.global_steps
+                log_data = {"train_loss": total_loss.item()}
+                pbar.set_postfix(log_data)
 
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.global_step += 1
+                if self.config.logging.use_wandb:
+                    wandb.log({**log_data, "global_step": self.global_step})
 
+                # --- Step-based Checkpointing ---
                 if (
                     self.global_step > 0
-                    and self.global_step % self.cfg.save_every_n_steps == 0
+                    and self.global_step % self.config.logging.save_every_n_steps == 0
                 ):
-                    self.save_checkpoint(filename=f"step_{self.global_step}.pt")
+                    self.save_checkpoint()
 
-            total_loss += loss.item()  # Log the combined loss
-            total_recon += losses["recon"].item()
-            total_kl += losses["kl"].item()
-            progress_bar.set_postfix(
-                {
-                    "Loss": f"{loss.item():.4f}",
-                    "Recon": f"{losses['recon'].item():.4f}",
-                    "KL": f"{losses['kl'].item():.4f}",
-                    "KL_W": f"{current_kl_weight:.6f}",
-                }
-            )
+            # --- End of Epoch Validation ---
+            val_log = self._run_validation()
+            is_best = val_log["val_loss"] < self.best_val_loss
+            if is_best:
+                self.best_val_loss = val_log["val_loss"]
 
-        avg_loss = total_loss / len(dataloader)
-        logger.info(
-            f"Epoch {self.epoch+1} Avg {'Train' if is_training else 'Valid'} Loss: {avg_loss:.4f}"
-        )
-        return avg_loss
+            logger.info(f"Epoch {epoch + 1} | Val Loss: {self.best_val_loss:.4f}")
+            if self.config.logging.use_wandb:
+                wandb.log({**val_log, "epoch": epoch})
 
-    def fit(self, train_loader: DataLoader, val_loader: DataLoader):
-        """The main training loop."""
-        logger.info("--- Starting End-to-End Training with Swin Transformer ---")
-        if self.epoch == 0:
-            self.save_checkpoint(filename="initial_model.pt")
+            if (epoch + 1) % self.config.logging.save_every_n_epochs == 0:
+                self.save_checkpoint(is_best=is_best)
 
-        for epoch in range(self.epoch, self.cfg.epochs):
-            self.epoch = epoch
-            self._run_epoch(train_loader, is_training=True)
-
-            with torch.no_grad():
-                val_loss = self._run_epoch(val_loader, is_training=False)
-
-            self.save_checkpoint(filename=f"epoch_{self.epoch+1}.pt")
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                logger.info(
-                    f"New best validation loss: {self.best_val_loss:.4f}. Saving best model."
-                )
-                self.save_checkpoint(filename="best_model.pt")
-
-        logger.info(f"--- Training Finished after {self.cfg.epochs} epochs ---")
+        logger.info("Training finished.")
