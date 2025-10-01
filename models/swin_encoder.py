@@ -5,8 +5,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import logging
-from swin_transformer_v2 import PatchEmbed, BasicLayer
-from config import VAEConfig  # Your config object
+from .swin_transformer_v2 import SwinTransformerV2
+from config import VAEConfig
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 class SwinVisionEncoder(nn.Module):
     """
-    Swin Transformer V2-based vision encoder.
+    Wrapper for the Swin Transformer V2 model to act as a vision encoder.
 
     Args:
         cfg (VAEConfig): Configuration with Swin-related hyperparameters.
@@ -26,53 +26,53 @@ class SwinVisionEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        # Patch embedding to convert image to patch tokens
-        self.patch_embed = PatchEmbed(
+        # Initialize the SwinTransformerV2 model with parameters from the config
+        self.model = SwinTransformerV2(
             img_size=cfg.image_size,
             patch_size=cfg.patch_size,
             in_chans=cfg.image_channels,
+            num_classes=0,  # We don't need the classification head
             embed_dim=cfg.encoder_dim,
-            norm_layer=nn.LayerNorm,
+            depths=cfg.swin_depths,
+            num_heads=cfg.swin_num_heads,
+            window_size=cfg.swin_window_size,
+            mlp_ratio=cfg.swin_mlp_ratio,
+            drop_path_rate=cfg.swin_drop_path_rate,
+            # We want the raw feature sequence, not the final pooled output
+            # so we will call forward_features instead of the full forward
         )
 
-        # Stages of Swin Transformer blocks (BasicLayer)
-        self.stages = nn.ModuleList()
-        embed_dim = cfg.encoder_dim
-        for i_layer in range(len(cfg.depths)):
-            layer = BasicLayer(
-                dim=int(embed_dim * 2**i_layer),
-                input_resolution=(
-                    self.patches_resolution[0] // (2**i_layer),
-                    self.patches_resolution[1] // (2**i_layer),
-                ),
-                depth=cfg.depths[i_layer],
-                num_heads=cfg.num_heads[i_layer],
-                window_size=cfg.window_size,
-                mlp_ratio=cfg.mlp_ratio,
-                drop=cfg.dropout,
-                downsample=True if i_layer < len(cfg.depths) - 1 else False,
+        # The final output dimension of the Swin encoder
+        self.output_dim = self.model.num_features
+
+        # This is a bit of a hack. The text decoder expects a specific dimension.
+        # If the Swin output dim doesn't match, we add a projection layer.
+        if self.output_dim != cfg.text_decoder_dim:
+            self.feature_projection = nn.Linear(self.output_dim, cfg.text_decoder_dim)
+            logger.info(
+                f"Projecting Swin output from {self.output_dim} to {cfg.text_decoder_dim}"
             )
-            self.stages.append(layer)
+        else:
+            self.feature_projection = nn.Identity()
 
-        # Final layer normalization
-        self.norm = nn.LayerNorm(int(embed_dim * 2 ** (len(cfg.depths) - 1)))
-
-        logger.info(f"SwinVisionEncoder initialized with {len(cfg.depths)} stages.")
+        logger.info(f"SwinVisionEncoder initialized with depths: {cfg.swin_depths}.")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
+        Passes the input image through the Swin Transformer to get feature embeddings.
+
         Args:
             x: Input tensor of shape [B, C, H, W]
         Returns:
-            Tensor of shape [B, N, D] where N is the final sequence length and D is the final embedding dim
+            Tensor of shape [B, N, D] where D matches text_decoder_dim
         """
-        x = self.patch_embed(x)  # B, C, H', W'
-        B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2).view(B, H, W, C)  # B, H, W, C
+        # The SwinTransformerV2 class has a `forward_features` method
+        # that returns the sequence of patch embeddings before the final pooling and head.
+        # This gives us the feature sequence we need.
+        features = self.model.forward_features(x)
 
-        for stage in self.stages:
-            x = stage(x)
+        # Project features to the dimension expected by the text decoder
+        projected_features = self.feature_projection(features)
 
-        x = x.view(B, -1, x.shape[-1])  # flatten spatial dims
-        x = self.norm(x)  # B, N, D
-        return x
+        logger.debug(f"SwinVisionEncoder output shape: {projected_features.shape}")
+        return projected_features

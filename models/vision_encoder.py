@@ -67,13 +67,6 @@ class MultiHeadAttention(nn.Module):
         self.heads = heads
         self.scale = (dim // heads) ** -0.5
 
-        # --- IMPROVEMENT RECOMMENDATION ---
-        # The following manual implementation can be replaced by `torch.nn.functional.scaled_dot_product_attention`
-        # in PyTorch 2.0+ for significant performance and memory improvements. It fuses the operations into
-        # a single kernel, which is much faster.
-        # Example: F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout)
-
-        # Separate linear layers for query, key, and value are clearer, especially for cross-attention.
         self.to_q = nn.Linear(dim, dim, bias=False)
         self.to_k = nn.Linear(dim, dim, bias=False)
         self.to_v = nn.Linear(dim, dim, bias=False)
@@ -92,44 +85,29 @@ class MultiHeadAttention(nn.Module):
             x (torch.Tensor): The input sequence (query). Shape: [B, N, D].
             context (torch.Tensor, optional): The context sequence (key, value).
                                               If None, performs self-attention. Shape: [B, M, D].
-            mask (torch.Tensor, optional): Attention mask.
+            mask (torch.Tensor, optional): Attention mask (must be boolean for fused attention).
         """
-        B, N, D = x.shape
         # Use x as context for self-attention if no context is provided.
         kv_input = context if context is not None else x
 
-        # --- BUG FIX ---
-        # The original code concatenated x and context then did a single qkv projection,
-        # which is incorrect for cross-attention where query, key, and value come from different sources.
-        # This corrected version projects them separately.
-        q = self.to_q(x)  # Query comes from the input sequence `x`
-        k = self.to_k(
-            kv_input
-        )  # Key comes from the `context` (or `x` in self-attention)
-        v = self.to_v(
-            kv_input
-        )  # Value comes from the `context` (or `x` in self-attention)
+        # **Corrected**: Separate Q, K, and V projections for cross-attention
+        q = self.to_q(x)
+        k = self.to_k(kv_input)
+        v = self.to_v(kv_input)
 
         # Reshape for multi-head attention: [B, N, D] -> [B, H, N, D/H]
         q = rearrange(q, "b n (h d) -> b h n d", h=self.heads)
         k = rearrange(k, "b m (h d) -> b h m d", h=self.heads)
         v = rearrange(v, "b m (h d) -> b h m d", h=self.heads)
 
-        # Scaled Dot-Product Attention
-        attn_scores = torch.einsum("b h i d, b h j d -> b h i j", q, k) * self.scale
-
-        if mask is not None:
-            # The mask should be broadcastable to the attention scores shape [B, H, N, M]
-            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
-
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        attn_probs = self.dropout(attn_probs)
-
-        # Apply attention to values
-        output = torch.einsum("b h i j, b h j d -> b h i d", attn_probs, v)
+        # **Optimized**: Use PyTorch 2.0's fused scaled dot-product attention
+        # The mask from TextDecoder is already boolean and broadcastable.
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=self.dropout.p if self.training else 0.0
+        )
 
         # Concatenate heads and project out
-        output = rearrange(output, "b h n d -> b n (h d)")
+        output = rearrange(attn_output, "b h n d -> b n (h d)")
         return self.out_proj(output)
 
 
