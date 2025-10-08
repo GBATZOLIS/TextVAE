@@ -1,55 +1,55 @@
-"""Global configuration dataclass used across the project."""
-from dataclasses import dataclass, field
+# config.py
 
-@dataclass
-class VAEConfig:
-    # ---------- image ----------
-    image_size: int = 256
-    image_channels: int = 3
-    patch_size: int = 16
+import torch
 
-    # ---------- encoder ----------
-    encoder_dim: int = 768
-    encoder_depth: int = 12
-    encoder_heads: int = 12
-    encoder_mlp_dim: int = 3072
-    encoder_dropout: float = 0.1
+# --- Overall Project Config ---
+PROJECT_NAME = "Variable_Length_VQVAE"
+WANDB_ENTITY = "rg625-university-of-cambridge"  # <-- CHANGE THIS
+RUN_NAME = "e2e_run_1"
+SEED = 42
 
-    # ---------- text decoder ----------
-    text_decoder_dim: int = 768
-    text_decoder_depth: int = 6
-    text_decoder_heads: int = 12
-    text_decoder_mlp_dim: int = 3072
-    text_decoder_dropout: float = 0.1
-    max_text_length: int = 77
-    vocab_size: int = 50257  # GPT‑2 vocab size
+# --- Model Config ---
+D_MODEL = 128  # The central embedding dimension for all components
+MAX_N_GENERATE = 128  # The maximum number of "elaboration" tokens to generate
 
-    # ---------- gumbel softmax ----------
-    gumbel_temperature: float = 1.0
-    gumbel_temperature_min: float = 0.1
-    gumbel_anneal_rate: float = 3e-5
-    use_straight_through: bool = True
+VQ_VAE_CONFIG = {
+    "in_channels": 3,
+    "num_hiddens": 128,
+    "num_residual_layers": 2,
+    "residual_hidden_dim": 32,
+    "num_embeddings": 512,
+    "embedding_dim": D_MODEL,
+    "commitment_cost": 0.25,
+}
 
-    # ---------- diffusion ----------
-    diffusion_timesteps: int = 1000
-    beta_start: float = 1e-4
-    beta_end: float = 0.02
+AUTOREGRESSIVE_CONFIG = {
+    "n_codes": VQ_VAE_CONFIG["num_embeddings"],
+    "d_model": D_MODEL,
+    "n_head": 4,
+    "n_layers": 4,
+    "max_fixed_len": 8 * 8,  # 64, from the VQ-VAE encoder output shape
+}
 
-    # ---------- optimisation ----------
-    kl_weight: float = 0.1
-    learning_rate: float = 1e-4
-    batch_size: int = 16
-    gradient_accumulation_steps: int = 1
-    amp: bool = True  # Automatic mixed precision
+DECODER_CONFIG = {
+    "n_pixels_rgb": 256,
+    "d_model": D_MODEL,
+    "n_head": 4,
+    "n_layers": 4,
+    # Max seq len must account for the maximum possible latent sequence
+    "max_seq_len": (32 * 32 * 3)
+    + AUTOREGRESSIVE_CONFIG["max_fixed_len"]
+    + MAX_N_GENERATE,
+}
 
-    # ---------- LLM prior ----------
-    llm_model_name: str = "gpt2"
-    freeze_llm: bool = True
+# --- Training Hyperparameters ---
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 16  # Smaller batch size due to the large model
+VALIDATION_BATCH_SIZE = 64
+NUM_EPOCHS = 50
+LEARNING_RATE = 1e-4
+DATASET_PATH = "~/datasets/cifar10/"
 
-    # ---------- misc ----------
-    seed: int = 42
-    log_every: int = 100
-    save_every_epochs: int = 5
-
-    # Dynamically tracked fields (do not set manually)
-    global_step: int = field(default=0, init=False)
+# --- Visualization & Logging ---
+LOG_INTERVAL = 100  # Log metrics every 100 batches
+SAVE_IMAGE_INTERVAL = 1  # Save a sample image every N epochs
+RESULTS_DIR = "results"

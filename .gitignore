@@ -102,3 +102,5 @@ wandb-summary.json
 *.tmp
 *.bak
 *.swp
+*.txt
+*.yaml
