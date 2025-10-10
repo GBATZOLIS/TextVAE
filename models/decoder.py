@@ -1,77 +1,68 @@
-# models/decoder.py
-
-import torch
-import torch.nn as nn
+from torch import nn
+from einops import rearrange
 import math
+import config
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=4096):
-        super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer("pe", pe)
-
-    def forward(self, x):
-        x = x + self.pe[:, : x.size(1), :]
-        return x
-
-
-class DecoderTransformer(nn.Module):
+class ViTDecoder(nn.Module):
     """
-    An autoregressive Transformer that generates an image pixel-by-pixel,
-    conditioned on a variable-length sequence of latent vectors.
+    The ViT Decoder for direct image reconstruction.
+    This takes a sequence of latent codes and reconstructs an image using a
+    Transformer followed by a convolutional head to stitch patches together.
     """
 
-    def __init__(
-        self, n_pixels_rgb, d_model, n_head, n_layers, max_seq_len, dropout=0.1
-    ):
+    def __init__(self):
         super().__init__()
-        self.d_model = d_model
-        self.pixel_embedding = nn.Embedding(n_pixels_rgb, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, max_len=max_seq_len)
-
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=n_head,
-            dim_feedforward=4 * d_model,
-            dropout=dropout,
+        decoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.EMBEDDING_DIM,
+            nhead=config.DECODER_HEADS,
+            dim_feedforward=config.EMBEDDING_DIM * 4,
+            dropout=config.DROPOUT,
+            activation="gelu",
             batch_first=True,
         )
-        self.transformer_decoder = nn.TransformerDecoder(
-            decoder_layer, num_layers=n_layers
+        self.transformer_decoder = nn.TransformerEncoder(
+            decoder_layer, num_layers=config.DECODER_LAYERS
         )
-        self.output_head = nn.Linear(d_model, n_pixels_rgb)
-        self.register_buffer(
-            "causal_mask", self.generate_square_subsequent_mask(max_seq_len)
+        self.conv_head = self._build_conv_head()
+
+    def _build_conv_head(self):
+        """Dynamically builds the convolutional head based on patch size."""
+        layers = []
+        # Calculate how many times we need to double the resolution
+        num_upsamples = int(math.log2(config.PATCH_SIZE))
+
+        in_channels = config.EMBEDDING_DIM
+        for i in range(num_upsamples):
+            out_channels = in_channels // 2
+            layers.append(
+                nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+            )
+            layers.append(nn.ReLU())
+            in_channels = out_channels
+
+        # Final layer to match the original number of image channels
+        layers.append(
+            nn.Conv2d(in_channels, config.IN_CHANNELS, kernel_size=3, padding=1)
+        )
+        layers.append(nn.Tanh())  # Output pixels in [-1, 1] range
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): The sequence of quantized codes, shape (B, num_patches, D).
+        """
+        # Process through Transformer blocks
+        reconstructed_patches_embed = self.transformer_decoder(x)
+
+        # Reshape sequence into a spatial feature map for the conv head
+        h_w = int(config.NUM_PATCHES**0.5)
+        feature_map = rearrange(
+            reconstructed_patches_embed, "b (h w) c -> b c h w", h=h_w, w=h_w
         )
 
-    def generate_square_subsequent_mask(self, sz):
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = (
-            mask.float()
-            .masked_fill(mask == 0, float("-inf"))
-            .masked_fill(mask == 1, float(0.0))
-        )
-        return mask
-
-    def forward(self, memory, pixels_input):
-        pixel_embed = self.pixel_embedding(pixels_input)
-        pixel_embed = self.pos_encoder(pixel_embed)
-
-        # The latent sequence (memory) also needs positional encoding
-        memory = self.pos_encoder(memory)
-
-        tgt_len = pixels_input.size(1)
-        device = pixels_input.device
-        mask = self.causal_mask[:tgt_len, :tgt_len].to(device)
-
-        output = self.transformer_decoder(tgt=pixel_embed, memory=memory, tgt_mask=mask)
-        logits = self.output_head(output)
-        return logits
+        # Reconstruct the final image
+        reconstructed_image = self.conv_head(feature_map)
+        return reconstructed_image

@@ -1,51 +1,38 @@
-# utils/visualize.py
-
 import torch
-from torchvision.utils import save_image, make_grid
-import os
+from torchvision.utils import make_grid
 import wandb
 
 
 @torch.no_grad()
-def save_reconstruction_sample(model, images, epoch, device, config, prefix="train"):
+def save_reconstruction_sample(
+    model, image_batch, epoch, device, config, prefix="train"
+):
+    """
+    Saves a grid of original vs. reconstructed images and logs to wandb.
+    """
     model.eval()
 
-    n_generate = config.MAX_N_GENERATE // 2
+    # Generate reconstructions using the full, untruncated sequence
+    output = model(image_batch, seq_len=None)
+    reconstructions = output["reconstructions"]
 
-    pixels_quantized = ((images * 0.5 + 0.5) * 255).long()
-    pixels_flat = pixels_quantized.permute(0, 2, 3, 1).reshape(images.size(0), -1)
-    pixel_input = pixels_flat[:, :-1]
+    # De-normalize images for visualization
+    originals_denorm = image_batch * 0.5 + 0.5
+    recons_denorm = reconstructions * 0.5 + 0.5
 
-    model_output = model(images, pixel_input, n_generate)
-    logits = model_output["pixel_logits"]
+    # We'll show 16 originals and their reconstructions
+    num_images_to_save = min(16, image_batch.size(0))
 
-    recon_pixels_flat = torch.argmax(logits, dim=-1)
-
-    first_pixel = pixels_flat[:, 0].unsqueeze(1)
-    recon_pixels_flat = torch.cat([first_pixel, recon_pixels_flat], dim=1)
-
-    # --- FIX ---
-    # The original line incorrectly reshaped the flat pixel tensor, causing a dimension mismatch.
-    # The fix is to explicitly reshape to (B, H, W, C) and then permute to (B, C, H, W).
-    b, _, h, w = images.shape
-    c = 3  # for RGB images
-    recon_images = recon_pixels_flat.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
-
-    recon_images = recon_images.float() / 255.0
-    images_denorm = images * 0.5 + 0.5
-
-    # This line should now work correctly
-    comparison = torch.cat([images_denorm[:8], recon_images[:8]])
-    grid = make_grid(comparison)
-
-    save_dir = os.path.join(config.RESULTS_DIR, prefix)
-    os.makedirs(save_dir, exist_ok=True)
-
-    filepath = os.path.join(save_dir, f"reconstruction_epoch_{epoch}.png")
-    save_image(grid, filepath)
-
-    wandb.log(
-        {f"{prefix.capitalize()} Reconstructions Epoch {epoch}": wandb.Image(filepath)}
+    # Combine the batches
+    comparison_batch = torch.cat(
+        [originals_denorm[:num_images_to_save], recons_denorm[:num_images_to_save]]
     )
 
-    print(f"Saved {prefix} reconstruction sample to {filepath}")
+    # --- CORRECTED: Create a single image grid from the batch ---
+    # This converts the [32, 3, 32, 32] tensor into a single image tensor
+    # that wandb can display. The top row will be originals, bottom row reconstructions.
+    grid = make_grid(comparison_batch, nrow=num_images_to_save)
+
+    # Log the image grid to wandb
+    wandb.log({f"{prefix}/reconstructions": wandb.Image(grid)})
+    print(f"Logged reconstruction sample for epoch {epoch} to wandb.")

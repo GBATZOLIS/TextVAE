@@ -1,5 +1,3 @@
-# engine/trainer.py
-
 import torch
 import torch.nn as nn
 import random
@@ -17,39 +15,37 @@ class Trainer:
         self.optimizer = optimizer
         self.device = device
         self.config = config
-        self.pixel_criterion = nn.CrossEntropyLoss()
+        self.recon_criterion = nn.MSELoss()
 
     def train_epoch(self, epoch):
         self.model.train()
         total_loss, total_recon_loss, total_vq_loss, total_perplexity = 0, 0, 0, 0
+        # --- NEW: List to store sequence lengths for histogram logging ---
+        seq_lengths_epoch = []
 
         progress_bar = tqdm(
             self.train_loader, desc=f"Epoch {epoch}/{self.config.NUM_EPOCHS} [Training]"
         )
         for batch_idx, (images, _) in enumerate(progress_bar):
             images = images.to(self.device)
-
-            pixels_quantized = ((images * 0.5 + 0.5) * 255).long()
-            pixels_flat = pixels_quantized.permute(0, 2, 3, 1).reshape(
-                images.size(0), -1
-            )
-
-            pixel_input, pixel_target = pixels_flat[:, :-1], pixels_flat[:, 1:]
-
             self.optimizer.zero_grad()
 
-            current_n_generate = random.randint(1, self.config.MAX_N_GENERATE)
+            seq_len = None
+            if self.config.APPLY_TRUNCATION:
+                n = self.config.NUM_PATCHES
+                min_len = int(n * self.config.MIN_SEQ_LEN_FRAC)
+                seq_len = random.randint(min_len, n)
+                # Store the length for the epoch-end histogram
+                seq_lengths_epoch.append(seq_len)
 
-            model_output = self.model(images, pixel_input, current_n_generate)
-            logits, vq_loss, perplexity = (
-                model_output["pixel_logits"],
+            model_output = self.model(images, seq_len=seq_len)
+            reconstructed_images, vq_loss, perplexity = (
+                model_output["reconstructions"],
                 model_output["vq_loss"],
                 model_output["perplexity"],
             )
 
-            recon_loss = self.pixel_criterion(
-                logits.reshape(-1, logits.size(-1)), pixel_target.reshape(-1)
-            )
+            recon_loss = self.recon_criterion(reconstructed_images, images)
             total_loss_batch = recon_loss + vq_loss
 
             total_loss_batch.backward()
@@ -61,13 +57,13 @@ class Trainer:
             total_perplexity += perplexity.item()
 
             if batch_idx % self.config.LOG_INTERVAL == 0:
+                # Log batch-level metrics
                 wandb.log(
                     {
                         "train/batch_loss": total_loss_batch.item(),
                         "train/recon_loss": recon_loss.item(),
                         "train/vq_loss": vq_loss.item(),
                         "train/perplexity": perplexity.item(),
-                        "train/N_generated": current_n_generate,
                         "epoch": epoch,
                     }
                 )
@@ -80,21 +76,22 @@ class Trainer:
             )
 
         num_batches = len(self.train_loader)
-        wandb.log(
-            {
-                "train/avg_epoch_loss": total_loss / num_batches,
-                "train/avg_epoch_recon_loss": total_recon_loss / num_batches,
-                "train/avg_epoch_vq_loss": total_vq_loss / num_batches,
-                "train/avg_epoch_perplexity": total_perplexity / num_batches,
-                "epoch": epoch,
-            }
-        )
+        # --- UPDATED: Log epoch-level metrics and the histogram ---
+        epoch_logs = {
+            "train/avg_epoch_loss": total_loss / num_batches,
+            "train/avg_epoch_recon_loss": total_recon_loss / num_batches,
+            "train/avg_epoch_vq_loss": total_vq_loss / num_batches,
+            "train/avg_epoch_perplexity": total_perplexity / num_batches,
+            "epoch": epoch,
+        }
+        if self.config.APPLY_TRUNCATION and seq_lengths_epoch:
+            epoch_logs["train/seq_len_histogram"] = wandb.Histogram(seq_lengths_epoch)
+        wandb.log(epoch_logs)
 
     @torch.no_grad()
     def validate_epoch(self, epoch):
         self.model.eval()
         total_loss, total_recon_loss, total_vq_loss, total_perplexity = 0, 0, 0, 0
-        n_generate = self.config.MAX_N_GENERATE // 2
 
         progress_bar = tqdm(
             self.val_loader, desc=f"Epoch {epoch}/{self.config.NUM_EPOCHS} [Validation]"
@@ -102,22 +99,14 @@ class Trainer:
         for images, _ in progress_bar:
             images = images.to(self.device)
 
-            pixels_quantized = ((images * 0.5 + 0.5) * 255).long()
-            pixels_flat = pixels_quantized.permute(0, 2, 3, 1).reshape(
-                images.size(0), -1
-            )
-            pixel_input, pixel_target = pixels_flat[:, :-1], pixels_flat[:, 1:]
-
-            model_output = self.model(images, pixel_input, n_generate)
-            logits, vq_loss, perplexity = (
-                model_output["pixel_logits"],
+            model_output = self.model(images, seq_len=None)
+            reconstructed_images, vq_loss, perplexity = (
+                model_output["reconstructions"],
                 model_output["vq_loss"],
                 model_output["perplexity"],
             )
 
-            recon_loss = self.pixel_criterion(
-                logits.reshape(-1, logits.size(-1)), pixel_target.reshape(-1)
-            )
+            recon_loss = self.recon_criterion(reconstructed_images, images)
             total_loss_batch = recon_loss + vq_loss
 
             total_loss += total_loss_batch.item()
@@ -172,5 +161,9 @@ class Trainer:
                     prefix="validation",
                 )
 
-            model_path = os.path.join(wandb.run.dir, f"model_epoch_{epoch}.pth")
+            model_dir = os.path.join(
+                wandb.run.dir, f"patch_{self.config.PATCH_SIZE}/checkpoints"
+            )
+            os.makedirs(model_dir, exist_ok=True)
+            model_path = os.path.join(model_dir, f"model_epoch_{epoch}.pth")
             torch.save(self.model.state_dict(), model_path)

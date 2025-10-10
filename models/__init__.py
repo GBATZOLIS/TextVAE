@@ -1,7 +1,7 @@
 # models/__init__.py
-from .encoder import Encoder
-from .decoder import DecoderTransformer
+from .encoder import ViTEncoder
+from .decoder import ViTDecoder
 from .quantizer import VectorQuantizer
-from .vqvae import VQVAE_AR
+from .vqvae import VQVAE
 
-__all__ = ["Encoder", "DecoderTransformer", "VectorQuantizer", "VQVAE_AR"]
+__all__ = ["ViTEncoder", "ViTDecoder", "VectorQuantizer", "VQVAE"]

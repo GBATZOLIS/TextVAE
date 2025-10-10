@@ -1,50 +1,88 @@
-# generate.py
-# NOTE: This script is a placeholder for a true autoregressive generation.
-# A full implementation would involve generating pixels one by one, which is slow.
-# This script demonstrates how to load the model and perform a forward pass for reconstruction.
-
 import torch
-import config
-from models.vqvae import VQVAE_AR
-from utils.visualize import save_reconstruction_sample
-from utils.helper import get_data_loaders
+from torchvision.utils import save_image
 import os
 
+import config
+from models.vqvae import VQVAE
 
-def generate():
-    device = torch.device(config.DEVICE)
-    model_path = "model.pth"  # <-- CHANGE THIS to your trained model path
 
-    if not os.path.exists(model_path):
-        print(f"Error: Model path '{model_path}' not found.")
-        print("Please train a model first using 'main.py' and update the path.")
-        return
+@torch.no_grad()
+def generate_samples(model, num_samples, device):
+    """
+    Generates new image samples from the direct reconstruction VQ-VAE decoder.
+
+    NOTE: This function uses a naive, random sampling of latent codes. This will
+    result in noisy, incoherent images because the decoder expects a spatially
+    structured sequence of codes, not random ones. For high-quality generation,
+    these codes should be generated from a trained prior model.
+    """
+    model.eval()
+
+    # 1. Create a batch of random latent codes.
+    # These are random indices into the codebook.
+    random_indices = torch.randint(
+        low=0,
+        high=config.NUM_EMBEDDINGS,
+        size=(num_samples, config.NUM_PATCHES),
+        device=device,
+    )
+
+    # 2. Look up the corresponding embedding vectors from the codebook.
+    quantized_features = model.quantizer.embedding(random_indices)
+
+    # 3. Decode the vectors in a single forward pass to generate images.
+    # The decoder takes the full sequence of vectors and reconstructs an image.
+    generated_images = model.decoder(quantized_features)
+
+    # De-normalize the generated images from [-1, 1] to [0, 1] for saving.
+    generated_images_denorm = generated_images * 0.5 + 0.5
+
+    return generated_images_denorm
+
+
+def main():
+    """
+    Main function to load the trained model and generate new samples.
+    """
+    # --- Configuration ---
+    # NOTE: You must provide a path to a trained model checkpoint
+    MODEL_PATH = "/home/rg625/mnt/TextVAE/wandb/run-20251009_171927-crbijk7s/files/patch_4/checkpoints/model_epoch_2000.pth"
+    NUM_SAMPLES = 64
+    OUTPUT_DIR = "generated"
+
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+    print(f"Using device: {config.DEVICE}")
 
     # --- Load Model ---
-    print("Loading model...")
-    model = VQVAE_AR(
-        vq_vae_config=config.VQ_VAE_CONFIG,
-        ar_config=config.AUTOREGRESSIVE_CONFIG,
-        decoder_config=config.DECODER_CONFIG,
-    ).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-    print("Model loaded.")
+    model = VQVAE().to(config.DEVICE)
+    try:
+        model.load_state_dict(
+            torch.load(MODEL_PATH, map_location=config.DEVICE), strict=True
+        )
+    except FileNotFoundError:
+        print(f"Error: Model file not found at '{MODEL_PATH}'.")
+        print(
+            "Please train the model and update the MODEL_PATH variable in this script."
+        )
+        return
+    except Exception as e:
+        print(f"An error occurred while loading the model: {e}")
+        return
 
-    # --- Get Data Sample ---
-    print("Loading data sample...")
-    data_loader = get_data_loaders(config.DATASET_PATH, config.BATCH_SIZE)
-    sample_images, _ = next(iter(data_loader))
-    sample_images = sample_images.to(device)
+    # --- Generate and Save Samples ---
+    print(f"Generating {NUM_SAMPLES} new samples...")
+    samples = generate_samples(model, NUM_SAMPLES, config.DEVICE)
 
-    # --- Generate Reconstruction ---
-    print("Generating reconstruction...")
-    # This function is repurposed here to show a model forward pass
-    # For true generation, you'd build a new pixel-by-pixel generation loop
-    os.makedirs(config.RESULTS_DIR, exist_ok=True)
-    save_reconstruction_sample(model, sample_images, "final", device, config)
-    print(f"Reconstruction saved in '{config.RESULTS_DIR}' directory.")
+    # Save the grid of generated images
+    save_path = os.path.join(OUTPUT_DIR, "generated_samples_reconstruction.png")
+    save_image(samples, save_path, nrow=int(NUM_SAMPLES**0.5))
+    print(f"Saved generated samples to '{save_path}'")
+    print(
+        "NOTE: The images will look noisy because a proper prior model was not used to generate the latent codes."
+    )
 
 
 if __name__ == "__main__":
-    generate()
+    main()

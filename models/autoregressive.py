@@ -1,51 +1,60 @@
-# models/autoregressive.py
-
 import torch
-import torch.nn as nn
-from models.decoder import PositionalEncoding  # Re-use PositionalEncoding
+from torch import nn
+import config
 
 
-class ElaborationTransformer(nn.Module):
+class Prior(nn.Module):
     """
-    An autoregressive Transformer that takes a fixed sequence of codes
-    and generates N additional continuous embedding vectors to "elaborate" on the content.
+    An autoregressive Transformer model to learn the distribution of latent codes.
+
+    This model takes a sequence of latent code indices and learns to predict
+    the next code in the sequence. It's the "grammar" engine for the VQ-VAE.
     """
 
-    def __init__(self, n_codes, d_model, n_head, n_layers, max_fixed_len, dropout=0.1):
+    def __init__(self):
         super().__init__()
-        self.d_model = d_model
-        self.code_embedding = nn.Embedding(n_codes, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, max_len=max_fixed_len)
+        # An embedding layer for the discrete latent codes from the VQ-VAE codebook
+        self.code_embedding = nn.Embedding(config.NUM_EMBEDDINGS, config.EMBEDDING_DIM)
 
+        # A positional embedding for the sequence of codes
+        self.pos_embedding = nn.Parameter(
+            torch.randn(1, config.NUM_PATCHES, config.EMBEDDING_DIM)
+        )
+
+        # A standard Transformer encoder layer
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_head,
-            dim_feedforward=4 * d_model,
-            dropout=dropout,
+            d_model=config.EMBEDDING_DIM,
+            nhead=config.ENCODER_HEADS,  # Using same head count as VQ-VAE for consistency
+            dim_feedforward=config.EMBEDDING_DIM * 4,
+            dropout=config.DROPOUT,
+            activation="gelu",
             batch_first=True,
         )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=n_layers
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=config.ENCODER_LAYERS,  # Using same layer count as VQ-VAE
         )
-        self.output_head = nn.Linear(d_model, d_model)
 
-    def forward(self, fixed_codes, n_generate):
-        embedded_codes = self.code_embedding(fixed_codes)
-        embedded_codes = self.pos_encoder(embedded_codes)
+        # The output layer projects the transformer's output to logits over the codebook
+        self.output_projection = nn.Linear(config.EMBEDDING_DIM, config.NUM_EMBEDDINGS)
 
-        context = self.transformer_encoder(embedded_codes)
+    def forward(self, x):
+        """
+        Forward pass for the Prior model.
+        Args:
+            x (torch.Tensor): A sequence of latent code indices.
+                              Shape: (B, sequence_length).
+        Returns:
+            torch.Tensor: The logits for predicting the next code in the sequence.
+                          Shape: (B, sequence_length, num_embeddings).
+        """
+        # Embed the input code indices and add positional information
+        x = self.code_embedding(x) + self.pos_embedding[:, : x.size(1), :]
 
-        current_state = context.mean(dim=1).unsqueeze(1)
+        # Process the sequence through the transformer
+        x = self.transformer(x)
 
-        generated_vectors = []
-        for _ in range(n_generate):
-            next_vector = self.output_head(current_state)
-            generated_vectors.append(next_vector)
-            current_state = next_vector
+        # Project to logits
+        logits = self.output_projection(x)
 
-        if not generated_vectors:
-            return torch.empty(
-                (fixed_codes.size(0), 0, self.d_model), device=fixed_codes.device
-            )
-
-        return torch.cat(generated_vectors, dim=1)
+        return logits
