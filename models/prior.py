@@ -1,69 +1,92 @@
+# models/prior.py
+
 import torch
 from torch import nn
-from tqdm import tqdm
-
 import config
 
 
-class Prior(nn.Module):
+class CodebookPrior(nn.Module):
     """
-    An LSTM-based autoregressive prior.
-    This model's complexity is now configured via arguments to its constructor,
-    making it more modular and decoupled from the global config file.
+    An autoregressive Transformer model to learn the prior distribution
+    of the VQ-VAE codebook indices.
     """
 
-    def __init__(self, num_layers, embedding_dim, dropout):
+    def __init__(self, num_codes, embedding_dim, nhead, num_layers, dropout):
         super().__init__()
+        self.num_codes = num_codes
 
-        # The embedding layer converts discrete code indices into continuous vectors.
-        self.embedding = nn.Embedding(config.NUM_EMBEDDINGS, embedding_dim)
+        # --- Components ---
+        # An embedding layer for the codebook indices + a Start-Of-Sequence token
+        self.token_embedding = nn.Embedding(num_codes + 1, embedding_dim)
 
-        # The LSTM processes the sequence of embeddings. Dropout is included for regularization.
-        self.lstm = nn.LSTM(
-            input_size=embedding_dim,
-            hidden_size=embedding_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=(
-                dropout if num_layers > 1 else 0
-            ),  # Dropout is not applied if num_layers is 1
+        # Standard positional encoding
+        self.positional_embedding = nn.Parameter(
+            torch.randn(1, config.NUM_PATCHES + 1, embedding_dim)
         )
 
-        # The output layer projects the LSTM's hidden states back to logits
-        # for each possible code in the codebook.
-        self.output_projection = nn.Linear(embedding_dim, config.NUM_EMBEDDINGS)
+        # Transformer Decoder Layer
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=embedding_dim,
+            nhead=nhead,
+            dim_feedforward=embedding_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
 
-    def forward(self, x):
+        # The Transformer Decoder itself
+        self.transformer_decoder = nn.TransformerDecoder(
+            decoder_layer, num_layers=num_layers
+        )
+
+        # A final linear layer to project to the codebook vocabulary size
+        self.output_head = nn.Linear(embedding_dim, num_codes)
+
+        # A special token to signify the start of a sequence
+        self.sos_token = nn.Parameter(
+            torch.randn(1, 1, embedding_dim), requires_grad=False
+        )
+
+    def forward(self, indices):
         """
+        Forward pass for training the prior.
         Args:
-            x (torch.Tensor): A sequence of latent code indices, shape (B, N).
+            indices (torch.Tensor): A batch of ground-truth codebook indices.
+                                    Shape: (batch_size, num_patches).
+        Returns:
+            torch.Tensor: Logits over the codebook vocabulary for each position.
         """
-        # Embed the input sequence
-        x = self.embedding(x)
-        # Process with the LSTM
-        x, _ = self.lstm(x)
+        # Embed the input indices
+        token_embeds = self.token_embedding(indices)
+        b, n, d = token_embeds.shape
+
+        # Prepend the Start-Of-Sequence (SOS) token embedding
+        sos_embed = self.sos_token.expand(b, -1, -1)
+        seq = torch.cat([sos_embed, token_embeds], dim=1)[:, :-1, :]  # Shift right
+
+        # Add positional embeddings
+        seq += self.positional_embedding[:, :n, :]
+
+        # Generate a causal mask to prevent attention to future tokens
+        causal_mask = self.generate_square_subsequent_mask(n, device=indices.device)
+
+        # Pass through the transformer decoder (using itself as memory)
+        output = self.transformer_decoder(
+            tgt=seq, memory=seq, tgt_mask=causal_mask, memory_mask=causal_mask
+        )
+
         # Project to logits
-        logits = self.output_projection(x)
+        logits = self.output_head(output)
+
         return logits
 
-    @torch.no_grad()
-    def generate(self, n_samples, device):
-        """Autoregressively generates a sequence of latent codes."""
-        # Start with a random code for each sample
-        generated_codes = torch.randint(
-            0, config.NUM_EMBEDDINGS, (n_samples, 1), device=device
+    @staticmethod
+    def generate_square_subsequent_mask(sz, device):
+        """Generates a square causal mask for the sequence."""
+        mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
+        mask = (
+            mask.float()
+            .masked_fill(mask == 0, float("-inf"))
+            .masked_fill(mask == 1, float(0.0))
         )
-
-        print("Generating code sequences with LSTM prior...")
-        # Generate one code at a time
-        for _ in tqdm(range(config.NUM_PATCHES - 1)):
-            logits = self(generated_codes)
-            # We only care about the logits for the very next code
-            next_code_logits = logits[:, -1, :]
-            # Sample the next code from the probability distribution
-            probs = torch.softmax(next_code_logits, dim=-1)
-            next_code = torch.multinomial(probs, num_samples=1)
-            # Append the new code to our sequence
-            generated_codes = torch.cat([generated_codes, next_code], dim=1)
-
-        return generated_codes
+        return mask

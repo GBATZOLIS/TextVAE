@@ -1,3 +1,5 @@
+# models/vqvae.py
+
 import torch
 from torch import nn
 import config
@@ -13,7 +15,7 @@ class VQVAE(nn.Module):
         self.patch_embedding = PatchEmbedding()
         self.encoder = ViTEncoder()
         self.quantizer = VectorQuantizer(
-            num_embeddings=config.NUM_EMBEDDINGS,
+            num_embeddings=config.NUM_EMBEDTINGS,
             embedding_dim=config.EMBEDDING_DIM,
             beta=config.BETA,
         )
@@ -24,26 +26,36 @@ class VQVAE(nn.Module):
         Forward pass for the VQ-VAE.
         Args:
             images (torch.Tensor): The input images.
-            seq_len (int, optional): If provided, the sequence of latent codes
-                                     will be truncated to this length. Defaults to None.
+            seq_len (torch.Tensor, optional): A tensor of sequence lengths for each item
+                                              in the batch. Shape: (batch_size,).
+                                              Defaults to None.
         """
         # Encode the input image and quantize the features
         patches = self.patch_embedding(images)
         encoded_features = self.encoder(patches)
-        quantized_features, vq_loss, perplexity = self.quantizer(encoded_features)
+        quantized_features, vq_loss, perplexity, indeces = self.quantizer(
+            encoded_features
+        )
 
-        # --- NEW: Apply truncation based on the seq_len argument ---
+        mask = None
         if seq_len is not None:
             b, n, d = quantized_features.shape
-            # Create a mask to zero out tokens after the specified seq_len
-            mask = torch.arange(n, device=images.device)[None, :] < seq_len
-            quantized_features = quantized_features * mask.unsqueeze(-1)
+            # --- MODIFIED: Create a correctly shaped attention mask ---
+            # seq_len is now a tensor of shape (b,).
+            # We compare a range [0, 1, ..., n-1] with each length in seq_len.
+            # torch.arange is broadcast to (b, n)
+            # seq_len.unsqueeze(-1) is broadcast to (b, n)
+            # The result is a correctly shaped boolean mask (b, n).
+            mask = torch.arange(n, device=images.device)[None, :] >= seq_len.unsqueeze(
+                -1
+            )
 
-        # Decode the (potentially truncated) features to reconstruct the image
-        reconstructed_images = self.decoder(quantized_features)
+        # Decode the features to reconstruct the image, passing the mask
+        reconstructed_images = self.decoder(quantized_features, mask=mask)
 
         return {
             "reconstructions": reconstructed_images,
             "vq_loss": vq_loss,
             "perplexity": perplexity,
+            "indeces": indeces,
         }

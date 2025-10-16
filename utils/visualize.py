@@ -1,38 +1,29 @@
-import torch
-from torchvision.utils import make_grid
+import torchvision.utils as vutils
 import wandb
+import os
 
 
-@torch.no_grad()
-def save_reconstruction_sample(
-    model, image_batch, epoch, device, config, prefix="train"
-):
+def save_generated_images(prior_model, vqvae_model, num_images, device, save_path):
     """
-    Saves a grid of original vs. reconstructed images and logs to wandb.
+    Generates images using the prior and decodes them with the VQ-VAE decoder.
     """
-    model.eval()
+    print(f"Generating {num_images} new images...")
 
-    # Generate reconstructions using the full, untruncated sequence
-    output = model(image_batch, seq_len=None)
-    reconstructions = output["reconstructions"]
+    # 1. Generate new code sequences from the prior
+    generated_codes = prior_model.generate(num_samples=num_images, device=device)
 
-    # De-normalize images for visualization
-    originals_denorm = image_batch * 0.5 + 0.5
-    recons_denorm = reconstructions * 0.5 + 0.5
+    # 2. Look up the codebook embeddings for these codes
+    quantized_features = vqvae_model.quantizer.embedding(generated_codes)
 
-    # We'll show 16 originals and their reconstructions
-    num_images_to_save = min(16, image_batch.size(0))
+    # 3. Decode the features into images
+    reconstructed_images = vqvae_model.decoder(quantized_features)
+    reconstructed_images = reconstructed_images.mul(0.5).add(
+        0.5
+    )  # Denormalize from [-1, 1] to [0, 1]
 
-    # Combine the batches
-    comparison_batch = torch.cat(
-        [originals_denorm[:num_images_to_save], recons_denorm[:num_images_to_save]]
-    )
+    # 4. Save and log the images
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    vutils.save_image(reconstructed_images, save_path, nrow=int(num_images**0.5))
+    wandb.log({"generated_images": wandb.Image(save_path)})
 
-    # --- CORRECTED: Create a single image grid from the batch ---
-    # This converts the [32, 3, 32, 32] tensor into a single image tensor
-    # that wandb can display. The top row will be originals, bottom row reconstructions.
-    grid = make_grid(comparison_batch, nrow=num_images_to_save)
-
-    # Log the image grid to wandb
-    wandb.log({f"{prefix}/reconstructions": wandb.Image(grid)})
-    print(f"Logged reconstruction sample for epoch {epoch} to wandb.")
+    print(f"Saved generated images to {save_path}")
