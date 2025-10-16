@@ -1,19 +1,26 @@
 # models/quantizer.py
 
 import torch
-from torch import nn
-from torch.nn import functional as F
+from torch import nn, Tensor
 from sklearn.cluster import KMeans
 
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, beta, decay=0.99, epsilon=1e-5):
+    """
+    The Vector Quantizer (VQ) layer with Exponential Moving Average (EMA) updates
+    to prevent codebook collapse.
+    """
+
+    _ema_cluster_size: Tensor
+    _ema_w: Tensor
+    _initialized: Tensor
+
+    def __init__(self, num_embeddings, embedding_dim, beta, decay=0.99):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.beta = beta
-        self._decay = decay
-        self._epsilon = epsilon
+        self.decay = decay
 
         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
         self.embedding.weight.data.uniform_(
@@ -21,9 +28,8 @@ class VectorQuantizer(nn.Module):
         )
 
         self.register_buffer("_initialized", torch.tensor(False))
-        # --- Buffers for EMA updates ---
         self.register_buffer("_ema_cluster_size", torch.zeros(num_embeddings))
-        self.register_buffer("_ema_w", torch.zeros(num_embeddings, self.embedding_dim))
+        self.register_buffer("_ema_w", self.embedding.weight.data.clone())
 
     def forward(self, x):
         flat_input = x.view(-1, self.embedding_dim)
@@ -35,7 +41,6 @@ class VectorQuantizer(nn.Module):
         )
 
         encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
-
         encodings = torch.zeros(
             encoding_indices.shape[0], self.num_embeddings, device=x.device
         )
@@ -43,40 +48,35 @@ class VectorQuantizer(nn.Module):
 
         quantized = torch.matmul(encodings, self.embedding.weight).view(x.shape)
 
-        # --- EMA Codebook Update ---
-        if self.training and self._initialized:
-            # --- THE FIX: Detach flat_input to prevent graph leakage into the buffer ---
+        if self.training:
+            self._ema_cluster_size = self._ema_cluster_size * self.decay + (
+                1 - self.decay
+            ) * torch.sum(encodings, 0)
+
             dw = torch.matmul(encodings.t(), flat_input.detach())
+            self._ema_w = self._ema_w * self.decay + (1 - self.decay) * dw
 
-            # Use EMA to update the embedding vectors
-            self._ema_cluster_size.data.mul_(self._decay).add_(
-                torch.sum(encodings, 0), alpha=1 - self._decay
-            )
-            self._ema_w.data.mul_(self._decay).add_(dw, alpha=1 - self._decay)
-
-            # Laplace smoothing for cluster size
+            # --- FIX: Add a small epsilon to prevent division by zero ---
+            # This is crucial for numerical stability, especially if some codes
+            # are not used for a while, causing their cluster size to decay to zero.
             n = torch.sum(self._ema_cluster_size)
-            smoothed_cluster_size = (
-                (self._ema_cluster_size + self._epsilon)
-                / (n + self.num_embeddings * self._epsilon)
-                * n
-            )
+            normalized_cluster_size = self._ema_cluster_size * (
+                n / (n + 1e-5)
+            ) + 1e-5 * (1 / n)
 
-            # Update the codebook
             self.embedding.weight.data.copy_(
-                self._ema_w / smoothed_cluster_size.unsqueeze(1)
+                self._ema_w / normalized_cluster_size.unsqueeze(1)
             )
 
-        codebook_loss = F.mse_loss(quantized.detach(), x)
-        commitment_loss = F.mse_loss(quantized, x.detach())
+        codebook_loss = torch.mean((quantized.detach() - x) ** 2)
+        commitment_loss = torch.mean((quantized - x.detach()) ** 2)
         vq_loss = codebook_loss + self.beta * commitment_loss
 
         quantized = x + (quantized - x).detach()
-
         avg_probs = torch.mean(encodings, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
 
-        return quantized, vq_loss, perplexity, encoding_indices.squeeze()
+        return quantized, vq_loss, perplexity, encoding_indices
 
     @torch.no_grad()
     def k_means_init(self, features):
@@ -89,13 +89,5 @@ class VectorQuantizer(nn.Module):
         kmeans = KMeans(
             n_clusters=self.num_embeddings, n_init="auto", random_state=0
         ).fit(features_np)
-
         self.embedding.weight.data.copy_(torch.from_numpy(kmeans.cluster_centers_))
-
-        # Initialize EMA buffers
-        self._ema_w.data.copy_(self.embedding.weight.data)
-        self._ema_cluster_size.data.fill_(
-            1.0
-        )  # Start with a count of 1 for each cluster
-
         self._initialized.fill_(True)

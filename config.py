@@ -26,7 +26,7 @@ NUM_EMBEDTINGS = 512
 BETA = 0.25
 
 # --- VQ-VAE Training ---
-VQVAE_NUM_EPOCHS = 100
+VQVAE_NUM_EPOCHS = 1000
 # --- MODIFIED: Reduced batch size to prevent OOM errors ---
 VQVAE_BATCH_SIZE = 256
 VQVAE_LEARNING_RATE = 3e-4

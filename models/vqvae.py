@@ -51,7 +51,7 @@ class VQVAE(nn.Module):
             )
 
         # Decode the features to reconstruct the image, passing the mask
-        reconstructed_images = self.decoder(quantized_features, mask=mask)
+        reconstructed_images = self.decoder(quantized_features, key_padding_mask=mask)
 
         return {
             "reconstructions": reconstructed_images,

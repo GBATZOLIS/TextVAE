@@ -9,15 +9,18 @@ import torchvision.utils as vutils
 import os
 from .vgg_loss import VGGPerceptualLoss
 from models.prior import CodebookPrior
-import gc  # --- NEW: Import the garbage collection module ---
 
 
 class VQVAETrainer:
-    def __init__(self, model, train_loader, val_loader, optimizer, device, config):
+    # --- UPDATE: Accept the scheduler in the constructor ---
+    def __init__(
+        self, model, train_loader, val_loader, optimizer, scheduler, device, config
+    ):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.optimizer = optimizer
+        self.scheduler = scheduler  # Store the scheduler
         self.device = device
         self.config = config
         self.recon_criterion = nn.MSELoss()
@@ -25,25 +28,22 @@ class VQVAETrainer:
 
     def train_epoch(self, epoch):
         self.model.train()
-        # --- MODIFIED: Added accumulators for detailed loss components ---
         total_loss, total_recon_loss, total_vq_loss, total_perplexity = 0, 0, 0, 0
         total_mse_loss, total_perceptual_loss = 0, 0
-        seq_lengths_epoch = []
         progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch} [Training VQ-VAE]")
 
         for images, _ in progress_bar:
             images = images.to(self.device)
             self.optimizer.zero_grad()
 
-            seq_len = None
+            seq_len_tensor = None
             if self.config.APPLY_TRUNCATION:
                 n = self.config.NUM_PATCHES
                 b = images.shape[0]
                 min_len = n // 2
-                seq_len = torch.randint(min_len, n + 1, (b,), device=self.device)
-                seq_lengths_epoch.extend(seq_len.tolist())
+                seq_len_tensor = torch.randint(min_len, n + 1, (b,), device=self.device)
 
-            model_output = self.model(images, seq_len=seq_len)
+            model_output = self.model(images, seq_len=seq_len_tensor)
             reconstructed_images = model_output["reconstructions"]
             vq_loss = model_output["vq_loss"]
             perplexity = model_output["perplexity"]
@@ -60,7 +60,6 @@ class VQVAETrainer:
             total_recon_loss += recon_loss.item()
             total_vq_loss += vq_loss.item()
             total_perplexity += perplexity.item()
-            # --- MODIFIED: Accumulate detailed losses ---
             total_mse_loss += mse_loss.item()
             total_perceptual_loss += p_loss.item()
 
@@ -71,10 +70,11 @@ class VQVAETrainer:
                 }
             )
 
-            # --- REMOVED: Deleted the problematic batch-level wandb.log() call ---
-
         num_batches = len(self.train_loader)
-        # --- MODIFIED: Log all averaged metrics once per epoch for memory efficiency ---
+
+        # --- UPDATE: Step the scheduler after each epoch ---
+        self.scheduler.step()
+
         epoch_logs = {
             "train/vqvae_avg_epoch_loss": total_loss / num_batches,
             "train/vqvae_avg_epoch_recon_loss": total_recon_loss / num_batches,
@@ -83,10 +83,11 @@ class VQVAETrainer:
             / num_batches,
             "train/vqvae_avg_epoch_vq_loss": total_vq_loss / num_batches,
             "train/vqvae_avg_epoch_perplexity": total_perplexity / num_batches,
+            "train/learning_rate": self.scheduler.get_last_lr()[
+                0
+            ],  # Log the current LR
             "epoch": epoch,
         }
-        if self.config.APPLY_TRUNCATION and seq_lengths_epoch:
-            epoch_logs["train/seq_len_histogram"] = wandb.Histogram(seq_lengths_epoch)
         wandb.log(epoch_logs)
 
     @torch.no_grad()
@@ -98,8 +99,8 @@ class VQVAETrainer:
         n = self.config.NUM_PATCHES
         b = val_images.shape[0]
         min_len = n // 4
-        seq_len = torch.randint(min_len, n, (b,), device=self.device)
-        trunc_recon = self.model(val_images, seq_len=seq_len)["reconstructions"]
+        seq_len_tensor = torch.randint(min_len, n, (b,), device=self.device)
+        trunc_recon = self.model(val_images, seq_len=seq_len_tensor)["reconstructions"]
 
         val_images = val_images.mul(0.5).add(0.5)
         full_recon = full_recon.mul(0.5).add(0.5)
@@ -125,19 +126,27 @@ class VQVAETrainer:
     def sample_and_show_truncations(self, val_images):
         print("Generating samples from truncated sequences...")
         self.model.eval()
+
         patches = self.model.patch_embedding(val_images)
         encoded_features = self.model.encoder(patches)
         quantized_features, _, _, _ = self.model.quantizer(encoded_features)
+
         b, n, d = quantized_features.shape
         truncation_levels = [0.25, 0.50, 0.75, 1.0]
         num_images_to_show = 8
+
         all_images = [val_images[:num_images_to_show]]
+
         for level in truncation_levels:
             seq_len = int(n * level)
-            mask = torch.arange(n, device=self.device)[None, :] >= seq_len
-            mask = mask.expand(b, -1)
-            reconstructions = self.model.decoder(quantized_features, mask=mask)
-            all_images.append(reconstructions[:num_images_to_show])
+            if seq_len == 0:
+                continue
+
+            context = quantized_features[:num_images_to_show, :seq_len, :]
+
+            reconstructions = self.model.decoder(context, key_padding_mask=None)
+            all_images.append(reconstructions)
+
         comparison_grid = torch.cat(all_images)
         comparison_grid = comparison_grid.mul(0.5).add(0.5)
         save_dir = "outputs/samples"
@@ -185,7 +194,8 @@ class VQVAETrainer:
                 prior_optimizer.zero_grad()
 
                 with torch.no_grad():
-                    targets = self.model(images)["indices"]
+                    model_output = self.model(images)
+                    targets = model_output["indices"]
 
                 logits = prior_model(targets)
 
@@ -263,10 +273,6 @@ class VQVAETrainer:
             self.train_epoch(epoch)
             if epoch % 10 == 0 or epoch == self.config.VQVAE_NUM_EPOCHS:
                 self.save_reconstructions(epoch, val_sample_batch[:16])
-
-            # --- NEW: Explicitly clear memory at the end of each epoch ---
-            gc.collect()
-            torch.cuda.empty_cache()
 
         torch.save(self.model.state_dict(), self.config.VQVAE_CHECKPOINT_PATH)
         print(f"VQ-VAE model saved to {self.config.VQVAE_CHECKPOINT_PATH}")
