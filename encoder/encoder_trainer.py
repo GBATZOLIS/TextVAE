@@ -104,20 +104,14 @@ class Trainer:
             gt_clean = gt_text.replace("<|endoftext|>", "[EOS]")
 
             status = (
-                "✅"
+                "Correct"
                 if actual_stop_index == target_k
-                else f"❌ (Stopped at {actual_stop_index})"
-            )
-            corresponding_len = (
-                "✅"
-                if actual_stop_index == len(gt_clean)
-                else f"❌ (Acttual length at {len(gt_clean)})"
+                else f"Wrong: Stopped at {actual_stop_index} out of {len(gt_clean)}"
             )
 
             caption = (
                 f"Goal: {target_k} tokens\n"
                 f"Result: {status}\n\n"
-                f"Corr: {corresponding_len}\n\n"
                 f"Prediction:\n{clean_text}\n\n"
                 f"Ground Truth:\n{gt_clean}"
             )
