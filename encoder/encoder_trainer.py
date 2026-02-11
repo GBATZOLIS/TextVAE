@@ -10,115 +10,148 @@ class Trainer:
     def __init__(self, model, train_loader, val_loader, config):
         self.model = model
         self.train_loader = train_loader
-        self.val_loader = val_loader  # Can be None
+        self.val_loader = val_loader
         self.config = config
         self.device = config.device
 
-        # Tokenizer for decoding logs
         self.tokenizer = tiktoken.get_encoding("gpt2")
+        self.eos_token_id = 50256
 
-        self.optimizer = optim.AdamW(
-            model.parameters(), lr=config.lr, weight_decay=0.01
-        )
+        self.optimizer = optim.AdamW(model.parameters(), lr=config.lr)
 
-        self.criterion = nn.CrossEntropyLoss(ignore_index=50256)  # GPT2 PAD/EOS
+        # Ignore -100 to prevent learning "EOS after EOS"
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
 
         if config.use_wandb:
             wandb.init(project="planning-autoencoder", config=vars(config))
-            # Define metrics
-            wandb.define_metric("train_loss", summary="min")
 
     def unnormalize_image(self, tensor):
-        """Reverses ImageNet normalization for visualization"""
-        # Mean and Std from dataset.py
         mean = torch.tensor([0.485, 0.456, 0.406]).to(self.device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).to(self.device).view(1, 3, 1, 1)
+        return torch.clamp(tensor * std + mean, 0, 1)
 
-        img = tensor * std + mean
-        return torch.clamp(img, 0, 1)
-
-    def generate_sample(self, image, target_len):
-        """Greedy decoding loop for logging"""
+    def generate_natural(self, image, target_lens):
+        """
+        Generates exactly target_len tokens per sample.
+        Stops generation individually once target is reached.
+        """
         self.model.eval()
+
         B = image.shape[0]
+        target_len_tensor = target_lens.to(self.device)
 
-        # Start with a dummy token or standard start.
-        # Since we trained without explicit SOS, we can start with EOS (50256)
-        # or handle cold start in model. We'll assume cold start with dummy EOS.
-        input_ids = torch.full((B, 1), 50256, dtype=torch.long, device=self.device)
+        input_ids = torch.full(
+            (B, 1), self.eos_token_id, dtype=torch.long, device=self.device
+        )
 
-        target_len_tensor = torch.tensor([target_len] * B, device=self.device)
+        # Track how many tokens generated per sample
+        current_lengths = torch.zeros(B, dtype=torch.long, device=self.device)
 
-        for _ in range(target_len):
+        finished = torch.zeros(B, dtype=torch.bool, device=self.device)
+
+        while not finished.all():
             with torch.no_grad():
                 logits = self.model(image, input_ids, target_len_tensor)
-                # Get last token prediction
-                next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(1)
-                input_ids = torch.cat([input_ids, next_token], dim=1)
+                next_token = torch.argmax(logits[:, -1, :], dim=-1)
 
-        return input_ids[:, 1:]  # Remove the dummy start token
+            # Only update unfinished sequences
+            next_token = torch.where(
+                finished, torch.full_like(next_token, self.eos_token_id), next_token
+            )
+
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(1)], dim=1)
+
+            current_lengths += (~finished).long()
+            finished = current_lengths >= target_len_tensor
+
+        return input_ids[:, 1:]
 
     def log_predictions(self, epoch, num_samples=4):
-        """Logs images and generated captions to WandB"""
         if not self.config.use_wandb:
             return
 
-        # Get a batch
         loader = self.val_loader if self.val_loader else self.train_loader
-        images, tokens, lengths = next(iter(loader))
+        try:
+            images, inp_ids, _, lengths = next(iter(loader))
+        except StopIteration:
+            return
 
-        # Slice
         images = images[:num_samples].to(self.device)
-        tokens = tokens[:num_samples].to(self.device)
         lengths = lengths[:num_samples].to(self.device)
 
-        # Generate
-        # We use the ground truth length as the target constraint for the planner
-        # to see if it can reconstruct the concept GIVEN the correct length.
-
-        # Note: We pick the length of the first sample for simplicity in this greedy loop
-        # or we generate individually. Let's do batch generation assuming max length of batch.
-        max_len = lengths.max().item()
-        generated_ids = self.generate_sample(images, max_len)
-
+        generated_ids = self.generate_natural(images, lengths)
+        vis_images = self.unnormalize_image(images)
         wandb_images = []
 
-        vis_images = self.unnormalize_image(images)
-
         for i in range(len(images)):
-            # Decode Prediction
-            pred_text = self.tokenizer.decode(generated_ids[i].tolist())
-            # Decode Truth
-            true_text = self.tokenizer.decode(tokens[i].tolist())
+            target_k = lengths[i].item()
+            pred_seq = generated_ids[i].tolist()
 
-            # Create Caption
-            caption = f"Len: {lengths[i]}\nPred: {pred_text}\nTrue: {true_text}"
+            # Since we didn't force stop in the loop, let's see where the model put EOS
+            try:
+                # Find first EOS
+                actual_stop_index = pred_seq.index(self.eos_token_id) + 1
+            except ValueError:
+                actual_stop_index = -1  # Never stopped
+
+            # Slice for decoding up to target (or full generated if it failed)
+            display_seq = pred_seq[:target_k]
+            text = self.tokenizer.decode(display_seq)
+            clean_text = text.replace("<|endoftext|>", "[EOS]")
+            gt_seq = inp_ids[i].tolist()
+            gt_seq = gt_seq[:target_k]  # trim to target length
+            gt_text = self.tokenizer.decode(gt_seq)
+            gt_clean = gt_text.replace("<|endoftext|>", "[EOS]")
+
+            status = (
+                "✅"
+                if actual_stop_index == target_k
+                else f"❌ (Stopped at {actual_stop_index})"
+            )
+            corresponding_len = (
+                "✅"
+                if actual_stop_index == len(gt_clean)
+                else f"❌ (Acttual length at {len(gt_clean)})"
+            )
+
+            caption = (
+                f"Goal: {target_k} tokens\n"
+                f"Result: {status}\n\n"
+                f"Corr: {corresponding_len}\n\n"
+                f"Prediction:\n{clean_text}\n\n"
+                f"Ground Truth:\n{gt_clean}"
+            )
 
             wandb_images.append(wandb.Image(vis_images[i], caption=caption))
 
         wandb.log({"Validation Samples": wandb_images, "epoch": epoch})
-        self.model.train()
 
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
 
-        for step, (images, tokens, lengths) in enumerate(pbar):
-            images = images.to(self.device)
-            tokens = tokens.to(self.device)
-            lengths = lengths.to(self.device)
+        for step, (images, inp_ids, labels, lengths) in enumerate(pbar):
+            images, inp_ids, labels, lengths = (
+                images.to(self.device),
+                inp_ids.to(self.device),
+                labels.to(self.device),
+                lengths.to(self.device),
+            )
 
-            # Input: [SOS, w1, w2] -> Target: [w1, w2, EOS]
-            inp = tokens[:, :-1]
-            tgt = tokens[:, 1:]
+            # Input Prep: Prepend SOS (using EOS ID)
+            B = inp_ids.shape[0]
+            sos_token = torch.full(
+                (B, 1), self.eos_token_id, dtype=torch.long, device=self.device
+            )
+            model_inp = torch.cat([sos_token, inp_ids[:, :-1]], dim=1)
 
             self.optimizer.zero_grad()
 
-            # Forward
-            logits = self.model(images, inp, lengths)
-
-            loss = self.criterion(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1))
+            logits = self.model(images, model_inp, lengths)
+            loss = self.criterion(
+                logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
+            )
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -130,11 +163,73 @@ class Trainer:
             if self.config.use_wandb:
                 wandb.log({"train_loss": loss.item()})
 
-        # Log qualitative results at end of epoch
         self.log_predictions(epoch)
-
         return total_loss / len(self.train_loader)
 
-    def save(self, path):
-        torch.save(self.model.state_dict(), path)
-        print(f"Model saved to {path}")
+    def inference(self, override_length=None):
+        """
+        Runs inference on validation set.
+
+        Args:
+            override_length (int, optional):
+                If provided, forces all samples to generate this length.
+
+        Returns:
+            List of tuples:
+                (prediction_text, ground_truth_text, target_length)
+        """
+        self.model.eval()
+        results = []
+
+        loader = self.val_loader if self.val_loader else self.train_loader
+
+        with torch.no_grad():
+            for images, inp_ids, _, lengths in tqdm(loader, desc="Inference"):
+
+                images = images.to(self.device)
+
+                # Optionally override generation length
+                if override_length is not None:
+                    lengths = torch.full_like(lengths, override_length)
+                else:
+                    lengths = lengths.to(self.device)
+
+                generated_ids = self.generate_natural(images, lengths)
+
+                B = images.size(0)
+
+                for i in range(B):
+                    target_k = lengths[i].item()
+
+                    # ---- Prediction ----
+                    pred_seq = generated_ids[i].tolist()[:target_k]
+                    pred_text = self.tokenizer.decode(pred_seq)
+                    pred_text = pred_text.replace("<|endoftext|>", "[EOS]")
+
+                    # ---- Ground Truth ----
+                    gt_seq = inp_ids[i].tolist()[:target_k]
+                    gt_text = self.tokenizer.decode(gt_seq)
+                    gt_text = gt_text.replace("<|endoftext|>", "[EOS]")
+
+                    results.append((pred_text, gt_text, target_k))
+
+        return results
+
+    def save(self, path, epoch):
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "config": vars(self.config),
+        }
+        torch.save(checkpoint, path)
+
+    def load(self, path):
+        checkpoint = torch.load(path, map_location=self.device)
+
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        print(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
+
+        return checkpoint["epoch"] + 1  # resume from next epoch

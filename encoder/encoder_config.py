@@ -4,26 +4,27 @@ import torch
 
 @dataclass
 class EncoderConfig:
-    # --- Data Paths ---
-    json_path: str = "data/captions.json"
-    img_dir: str = "data/images/"
-    save_dir: str = "./checkpoints"
-
-    # --- Model Architecture ---
-    vit_dim: int = 512
-    vit_depth: int = 8
-    patch_size: int = 16
+    # Data & Paths
     img_size: int = 224
-    vocab_size: int = 50257  # GPT-2 default
-    max_len: int = 100
+    patch_size: int = 16
+    vocab_size: int = 50257  # GPT-2
+    max_len: int = 64
 
-    # --- Training Hyperparameters ---
-    batch_size: int = 1
-    epochs: int = 10
-    lr: float = 1e-4
-    dropout: float = 0.1
-
-    # --- System ---
+    # Checkpoint / Logging
+    save_dir: str = "./checkpoints"
+    # Pointing to your actual data source
+    json_path: str = "/home/rg625/mnt/TextVAE/data/captions.json"
+    img_dir: str = "/home/rg625/mnt/TextVAE/data/images"
     use_wandb: bool = True
+
+    # Model Params
+    vit_dim: int = 512
+    vit_depth: int = 6
+    heads: int = 8
+
+    # Training
+    batch_size: int = 128
+    lr: float = 3e-4
+    epochs: int = 250
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     num_workers: int = 4

@@ -1,146 +1,137 @@
 import torch
 import torch.nn as nn
+from .encoder_config import EncoderConfig
 
 
-# --- 1. Core Planning Mechanism ---
-class LDPE(nn.Module):
+class CountdownPositionalEmbedding(nn.Module):
     """
-    Length-Difference Positional Encoding.
-    Encodes: (Target_Length - Current_Position)
+    Encodes the distance to the Goal.
+    Instead of Pos 0, 1, 2... we encode (Target-0), (Target-1)...
+    When the embedding represents '0', the model knows it is AT the finish line.
     """
 
-    def __init__(self, d_model, max_len=200):
+    def __init__(self, dim, max_len=100):
         super().__init__()
-        self.embedding = nn.Embedding(max_len + 1, d_model)
+        # 0 to max_len. 0 is the "Finish Line".
+        self.embedding = nn.Embedding(max_len + 1, dim)
         self.max_len = max_len
 
-    def forward(self, x, target_lengths):
-        B, Seq, _ = x.shape
-        # Positions: [0, 1, 2...]
-        positions = torch.arange(Seq, device=x.device).unsqueeze(0)
-        # Targets: [Target, Target...]
-        targets = target_lengths.unsqueeze(1)
+    def forward(self, seq_len, target_lengths, device):
+        """
+        seq_len: Current sequence length (T)
+        target_lengths: Tensor of shape [B] containing the Goal Index
+        """
+        B = target_lengths.shape[0]
 
-        # Countdown: [Target, Target-1, Target-2...]
-        remaining = targets - positions
-        remaining = torch.clamp(remaining, min=0, max=self.max_len)
+        # Current Positions: [0, 1, 2, ... T-1]
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(B, -1)
 
-        return self.embedding(remaining)
+        # Target: [Goal, Goal, ...]
+        targets = target_lengths.unsqueeze(1).expand(B, seq_len)
+
+        # Distance: [Goal, Goal-1, ..., Goal-(T-1)]
+        # Example: Goal=3. Seq=[0,1,2]. Dist=[3, 2, 1].
+        # Wait, usually EOS is at index (Length-1).
+        # If Goal=3 (Length=3), indices are 0,1,2.
+        # At index 2 (EOS), we want Distance to be 0.
+        # So Formula: (Goal - 1) - Position
+
+        # Let's verify: Length=3. Indices=[0,1,2]. EOS is at 2.
+        # target_lengths passed from dataset is 3.
+        # (3-1) - 0 = 2
+        # (3-1) - 1 = 1
+        # (3-1) - 2 = 0 (At EOS position, distance is 0)
+
+        dist = (targets - 1) - positions
+        dist = torch.clamp(dist, min=0, max=self.max_len)
+
+        return self.embedding(dist)
 
 
-# --- 2. Vision Transformer (ViT) from Scratch ---
-class PatchEmbedding(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+class VisionEncoder(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, dim=512, depth=6, heads=8):
         super().__init__()
-        self.proj = nn.Conv2d(
-            in_chans, embed_dim, kernel_size=patch_size, stride=patch_size
-        )
-        self.num_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size)
+        num_patches = (img_size // patch_size) ** 2
 
-    def forward(self, x):
-        x = self.proj(x)  # [B, Embed, H', W']
-        x = x.flatten(2)  # [B, Embed, N_Patches]
-        x = x.transpose(1, 2)  # [B, N_Patches, Embed]
-        return x
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, dim))
 
-
-class VisionTransformer(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, embed_dim=512, depth=12, heads=8):
-        super().__init__()
-        self.patch_embed = PatchEmbedding(img_size, patch_size, 3, embed_dim)
-
-        # Learnable class token and position embeddings
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, 1 + self.patch_embed.num_patches, embed_dim)
-        )
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
+        layer = nn.TransformerEncoderLayer(
+            d_model=dim,
             nhead=heads,
-            dim_feedforward=embed_dim * 4,
+            dim_feedforward=dim * 4,
             activation="gelu",
             batch_first=True,
             norm_first=True,
         )
-        self.blocks = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-        self.norm = nn.LayerNorm(embed_dim)
+        self.blocks = nn.TransformerEncoder(layer, num_layers=depth)
 
     def forward(self, x):
         B = x.shape[0]
-        x = self.patch_embed(x)
-
-        # Append CLS token
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-
-        # Add Positional Embedding
+        x = self.proj(x).flatten(2).transpose(1, 2)
+        x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
         x = x + self.pos_embed
-
-        # Pass through Transformer
-        x = self.blocks(x)
-        x = self.norm(x)
-        return x
+        return self.blocks(x)
 
 
-# --- 3. Unified Autoencoder ---
-class Encoder(nn.Module):
-    def __init__(
-        self,
-        img_size=224,
-        patch_size=16,
-        vit_dim=512,
-        vit_depth=8,
-        vocab_size=50304,
-        max_len=100,
-    ):
+class PlanningAutoencoder(nn.Module):
+    def __init__(self, config: EncoderConfig):
         super().__init__()
+        self.config = config
 
-        # A. Independent Vision Encoder
-        self.vision_encoder = VisionTransformer(
-            img_size=img_size, patch_size=patch_size, embed_dim=vit_dim, depth=vit_depth
+        # 1. Vision
+        self.encoder = VisionEncoder(
+            config.img_size,
+            config.patch_size,
+            config.vit_dim,
+            config.vit_depth,
+            config.heads,
         )
 
-        # B. Text Decoder
-        self.token_emb = nn.Embedding(vocab_size, vit_dim)
-        self.ldpe = LDPE(vit_dim, max_len)
+        # 2. Text Embedding
+        self.token_emb = nn.Embedding(config.vocab_size, config.vit_dim)
 
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=vit_dim,
-            nhead=8,
-            dim_feedforward=vit_dim * 4,
-            activation="gelu",
+        # 3. The "Attention to Position" Mechanism
+        # This replaces standard positional encoding
+        self.countdown_pos = CountdownPositionalEmbedding(
+            config.vit_dim, config.max_len
+        )
+
+        # 4. Decoder
+        layer = nn.TransformerDecoderLayer(
+            d_model=config.vit_dim,
+            nhead=config.heads,
+            dim_feedforward=config.vit_dim * 4,
             batch_first=True,
             norm_first=True,
         )
-        self.text_decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)
+        self.decoder = nn.TransformerDecoder(layer, num_layers=config.vit_depth)
 
-        self.head = nn.Linear(vit_dim, vocab_size)
+        self.head = nn.Linear(config.vit_dim, config.vocab_size)
 
     def forward(self, images, input_ids, target_lengths):
         """
-        images: [B, C, H, W]
-        input_ids: [B, Seq_Len] (Tokens so far)
-        target_lengths: [B] (The plan)
+        target_lengths: [B] - The exact integer position where EOS should appear + 1.
         """
-        # 1. Encode Image -> Visual Memory
-        visual_memory = self.vision_encoder(images)  # [B, N_Patches+1, Dim]
+        B, L = input_ids.shape
 
-        # 2. Embed Text
-        tgt_emb = self.token_emb(input_ids)
+        memory = self.encoder(images)
 
-        # 3. Apply LDPE (The Planning Logic)
-        plan_emb = self.ldpe(tgt_emb, target_lengths)
-        tgt = tgt_emb + plan_emb
+        # Embed Tokens
+        x = self.token_emb(input_ids)
 
-        # 4. Causal Mask
-        seq_len = tgt.shape[1]
+        # Add Countdown Information
+        # This injects the "Distance to EOS" into every token's vector.
+        # Attention naturally compares these vectors.
+        # When a query with 'Dist=1' looks at keys, it knows it needs to wrap up.
+        countdown = self.countdown_pos(L, target_lengths, input_ids.device)
+        x = x + countdown
+
+        # Standard Causal Mask
         tgt_mask = torch.triu(
-            torch.full((seq_len, seq_len), float("-inf"), device=tgt.device), diagonal=1
+            torch.full((L, L), float("-inf"), device=input_ids.device), diagonal=1
         )
 
-        # 5. Decode
-        out = self.text_decoder(tgt=tgt, memory=visual_memory, tgt_mask=tgt_mask)
-
-        logits = self.head(out)
-        return logits
+        out = self.decoder(tgt=x, memory=memory, tgt_mask=tgt_mask)
+        return self.head(out)

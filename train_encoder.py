@@ -1,82 +1,152 @@
 import argparse
 import os
-from torch.utils.data import DataLoader
+import random
+import torch
+from torch.utils.data import DataLoader, Subset
 
-# Imports matching the generated file structure
-from dataset import ImageTextLengthDataset, collate_fn
-from encoder.encoder import Encoder
-from encoder.encoder_trainer import Trainer
 from encoder.encoder_config import EncoderConfig
+from dataset import ImageTextLengthDataset, collate_fn
+from encoder.encoder import PlanningAutoencoder
+from encoder.encoder_trainer import Trainer
 
 
-def train(config: EncoderConfig):
-    print("--- Independent Planning Autoencoder Training ---")
-    print(f"Device: {config.device} | Batch Size: {config.batch_size}")
+# -------------------------
+# Utilities
+# -------------------------
 
-    # 1. Dataset
-    # We pass the tokenizer model implied by vocab_size (gpt2)
-    dataset = ImageTextLengthDataset(
-        config.json_path, config.img_dir, image_size=config.img_size
-    )
 
-    loader = DataLoader(
-        dataset,
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def build_config_from_args(args) -> EncoderConfig:
+    """
+    Safely merges CLI overrides into dataclass config.
+    Only overrides values explicitly provided.
+    """
+    config = EncoderConfig()
+
+    for key, value in vars(args).items():
+        if value is not None:
+            setattr(config, key, value)
+
+    return config
+
+
+# -------------------------
+# Main
+# -------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--json_path", type=str)
+    parser.add_argument("--img_dir", type=str)
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--batch_size", type=int)
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--inference_only", action="store_true")
+    parser.add_argument("--resume", type=str, default=None)
+    args = parser.parse_args()
+
+    # Reproducibility
+    set_seed(args.seed)
+
+    # Build config safely
+    config = build_config_from_args(args)
+
+    print("\n===== FINAL CONFIG =====")
+    print(config)
+    print("========================\n")
+
+    # -------------------------
+    # Dataset
+    # -------------------------
+
+    if not os.path.exists(config.json_path):
+        raise FileNotFoundError(f"JSON file not found: {config.json_path}")
+
+    if not os.path.exists(config.img_dir):
+        raise FileNotFoundError(f"Image directory not found: {config.img_dir}")
+
+    full_dataset = ImageTextLengthDataset(config.json_path, config.img_dir)
+
+    if len(full_dataset) == 0:
+        raise ValueError("Dataset is empty. Aborting.")
+
+    print(f"Dataset size: {len(full_dataset)}")
+
+    # Split
+    indices = list(range(len(full_dataset)))
+    random.shuffle(indices)
+    split = int(0.9 * len(indices))
+
+    train_ds = Subset(full_dataset, indices[:split])
+    val_ds = Subset(full_dataset, indices[split:])
+
+    train_loader = DataLoader(
+        train_ds,
         batch_size=config.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=config.num_workers,
-        pin_memory=True if config.device == "cuda" else False,
     )
 
-    # 2. Model
-    model = Encoder(
-        img_size=config.img_size,
-        patch_size=config.patch_size,
-        vit_dim=config.vit_dim,
-        vit_depth=config.vit_depth,
-        vocab_size=config.vocab_size,
-        max_len=config.max_len,
-    ).to(config.device)
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=config.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=config.num_workers,
+    )
 
-    print(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    # -------------------------
+    # Model
+    # -------------------------
 
-    # 3. Trainer
-    trainer = Trainer(model, loader, None, config)
+    model = PlanningAutoencoder(config).to(config.device)
 
-    # 4. Training Loop
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model Parameters: {total_params:,}")
+
+    # -------------------------
+    # Trainer
+    # -------------------------
+
+    trainer = Trainer(model, train_loader, val_loader, config)
+    start_epoch = 0
+
+    if args.resume is not None:
+        trainer.load(args.resume)
+
+    if args.inference_only:
+        print("Running inference on validation set...")
+        outputs = trainer.inference()
+
+        for i in range(min(10, len(outputs))):
+            print(f"\nSample {i}:")
+            print(outputs[i])
+
+        return  # Exit without training
+
+    # -------------------------
+    # Training Loop
+    # -------------------------
+
     os.makedirs(config.save_dir, exist_ok=True)
 
-    for epoch in range(config.epochs):
+    for epoch in range(start_epoch, config.epochs):
         avg_loss = trainer.train_epoch(epoch)
-        print(f"Epoch {epoch} | Average Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch} | Loss: {avg_loss:.4f}")
 
-        # Save checkpoint
-        save_path = os.path.join(config.save_dir, f"model_ep{epoch}.pt")
-        trainer.save(save_path)
+        if (epoch + 1) % 10 == 0:
+            save_path = os.path.join(config.save_dir, f"model_epoch_{epoch+1}.pt")
+            trainer.save(save_path, epoch=epoch)
 
 
 if __name__ == "__main__":
-    # 1. Load Defaults
-    config = EncoderConfig()
-
-    # 2. Allow CLI overrides for common paths
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--json_path", type=str, help="Override JSON path")
-    parser.add_argument("--img_dir", type=str, help="Override Image dir")
-    parser.add_argument("--use_wandb", action="store_true", help="Enable WandB")
-    parser.add_argument("--batch_size", type=int, help="Override batch size")
-
-    args = parser.parse_args()
-
-    # Update config only if args are provided
-    if args.json_path:
-        config.json_path = args.json_path
-    if args.img_dir:
-        config.img_dir = args.img_dir
-    if args.use_wandb:
-        config.use_wandb = True
-    if args.batch_size:
-        config.batch_size = args.batch_size
-
-    # 3. Run
-    train(config)
+    main()
