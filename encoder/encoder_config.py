@@ -15,7 +15,7 @@ class EncoderConfig:
     # Pointing to your actual data source
     json_path: str = "/home/rg625/mnt/TextVAE/data/captions.json"
     img_dir: str = "/home/rg625/mnt/TextVAE/data/images"
-    use_wandb: bool = True
+    use_wandb: bool = False
 
     # Model Params
     vit_dim: int = 512
@@ -23,7 +23,7 @@ class EncoderConfig:
     heads: int = 8
 
     # Training
-    batch_size: int = 128
+    batch_size: int = 64
     lr: float = 3e-4
     epochs: int = 250
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

@@ -228,6 +228,61 @@ class Trainer:
         self.log_predictions(epoch)
         return total_loss / len(self.train_loader)
 
+    def generate_with_custom_length(
+        self,
+        target_length: int,
+        num_samples: int = 8,
+        temperature: float = 1.0,
+        top_k: int = 50,
+    ):
+        """
+        Generate captions from validation images using a user-specified target length.
+        """
+
+        self.model.eval()
+
+        if self.val_loader is None:
+            raise ValueError("Validation loader not available.")
+
+        # Grab one batch
+        images, _, _, _ = next(iter(self.val_loader))
+
+        images = images[:num_samples].to(self.device)
+
+        # 🔥 Here is the important part:
+        target_lengths = torch.full(
+            (images.size(0),), target_length, dtype=torch.long, device=self.device
+        )
+
+        generated_ids = self.generate_controlled(
+            images, target_lengths, temperature=temperature, top_k=top_k
+        )
+
+        results = []
+
+        for i in range(images.size(0)):
+            tokens = generated_ids[i].tolist()
+
+            if self.eos_token_id in tokens:
+                eos_idx = tokens.index(self.eos_token_id)
+                tokens = tokens[: eos_idx + 1]
+
+            text = self.tokenizer.decode(tokens).replace("<|endoftext|>", "")
+
+            print(f"\nTarget Length: {target_length}")
+            print(f"Actual Length: {len(tokens)}")
+            print(text)
+
+            results.append(
+                {
+                    "target_length": target_length,
+                    "actual_length": len(tokens),
+                    "text": text,
+                }
+            )
+
+        return results
+
     def save(self, path, epoch):
         checkpoint = {
             "epoch": epoch,

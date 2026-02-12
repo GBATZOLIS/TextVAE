@@ -6,9 +6,8 @@ from torch.utils.data import DataLoader, Subset
 
 from encoder.encoder_config import EncoderConfig
 from dataset import ImageTextLengthDataset, collate_fn
-from encoder.encoder import PlanningAutoencoder
+from encoder.pretrained_encoder import PlanningGPT2
 from encoder.encoder_trainer import Trainer
-
 
 # -------------------------
 # Utilities
@@ -108,7 +107,7 @@ def main():
     # Model
     # -------------------------
 
-    model = PlanningAutoencoder(config).to(config.device)
+    model = PlanningGPT2(config).to(config.device)
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model Parameters: {total_params:,}")
