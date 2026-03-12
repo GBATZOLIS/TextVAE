@@ -1,32 +1,28 @@
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset, get_worker_info
 from torchvision import transforms
+from datasets import load_dataset
+from transformers import GPT2Tokenizer
 from PIL import Image
-import json
-import os
-import tiktoken
+import requests
+from io import BytesIO
+
+# --- HPC SAFETY: Prevent Decompression Bomb crashes on large web images ---
+Image.MAX_IMAGE_PIXELS = None
 
 
-class ImageTextLengthDataset(Dataset):
-    def __init__(self, json_path, image_dir, image_size=224, tokenizer_model="gpt2"):
-        self.image_dir = image_dir
-
-        # Load Data
-        if not os.path.exists(json_path):
-            print(f"Warning: {json_path} not found. Generating dummy data.")
-            self.data = [
-                {
-                    "file_name": "dummy.jpg",
-                    "caption": "A photo of a cat sitting on a mat.",
-                }
-            ] * 100
-        else:
-            with open(json_path, "r") as f:
-                self.data = json.load(f)
+class StreamingDenseCaptionDataset(IterableDataset):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.dataset = load_dataset(
+            config.hf_dataset_path, split="train", streaming=True
+        )
 
         self.transform = transforms.Compose(
             [
-                transforms.Resize((image_size, image_size)),
+                transforms.Resize((config.img_size, config.img_size)),
+                transforms.CenterCrop(config.img_size),
                 transforms.ToTensor(),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
@@ -34,46 +30,73 @@ class ImageTextLengthDataset(Dataset):
             ]
         )
 
-        self.tokenizer = tiktoken.get_encoding(tokenizer_model)
-        self.eos_token = 50256
+        self.tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        item = self.data[idx]
-
-        # 1. Image
-        img_path = os.path.join(self.image_dir, item["file_name"])
+    def _process_item(self, item):
         try:
-            image = Image.open(img_path).convert("RGB")
-            image = self.transform(image)
-        except (FileNotFoundError, OSError):
-            # Fallback for missing images to prevent crash
-            image = torch.zeros((3, 224, 224))
+            if "image" in item and isinstance(item["image"], Image.Image):
+                image = item["image"].convert("RGB")
+            elif "image_url" in item and isinstance(item["image_url"], str):
+                response = requests.get(item["image_url"], timeout=5)
+                image = Image.open(BytesIO(response.content)).convert("RGB")
+            elif "url" in item and isinstance(item["url"], str):
+                response = requests.get(item["url"], timeout=5)
+                image = Image.open(BytesIO(response.content)).convert("RGB")
+            else:
+                val = list(item.values())[0]
+                if isinstance(val, Image.Image):
+                    image = val.convert("RGB")
+                else:
+                    return None
 
-        # 2. Text Processing
-        # CHANGE: No random truncation. We take the full caption.
-        tokens = self.tokenizer.encode(item["caption"])
+            image_tensor = self.transform(image)
 
-        # Ensure we don't exceed a reasonable max length (e.g. 128) to prevent OOM
-        # but try to keep the full sentence structure.
-        max_capacity = 128
-        if len(tokens) > max_capacity - 1:
-            tokens = tokens[: max_capacity - 1]
+            caption = item.get("text", item.get("caption", ""))
+            if isinstance(caption, list):
+                caption = caption[0]
 
-        # Add EOS
-        tokens.append(self.eos_token)
+            caption = str(caption).strip()
+            if not caption:
+                return None
 
-        token_tensor = torch.tensor(tokens, dtype=torch.long)
+            encoded = self.tokenizer(
+                caption,
+                truncation=True,
+                max_length=self.config.max_len,
+                return_tensors="pt",
+            )
+            ids = encoded.input_ids.squeeze(0)
 
-        # The Target Length is the index where EOS is located.
-        # If tokens = [A, Cat, EOS], length is 3.
-        # Indices: 0, 1, 2.
-        # We want the model to put EOS at position (length-1).
-        length = len(tokens)
+            if ids[-1] != self.tokenizer.eos_token_id:
+                if len(ids) == self.config.max_len:
+                    ids[-1] = self.tokenizer.eos_token_id
+                else:
+                    ids = torch.cat([ids, torch.tensor([self.tokenizer.eos_token_id])])
 
-        return image, token_tensor, length
+            length = len(ids)
+            return image_tensor, ids, length
+
+        except Exception:
+            return None
+
+    def __iter__(self):
+        # --- HPC I/O PARALLELIZATION ---
+        # If num_workers > 0, we MUST shard the streaming dataset, otherwise
+        # all CPUs download the exact same images, duplicating data and ruining training.
+        worker_info = get_worker_info()
+        if worker_info is not None:
+            # Hugging Face natively supports sharding iterable datasets
+            iterable = self.dataset.shard(
+                num_shards=worker_info.num_workers, index=worker_info.id
+            )
+        else:
+            iterable = self.dataset
+
+        for item in iterable:
+            processed = self._process_item(item)
+            if processed is not None:
+                yield processed
 
 
 def collate_fn(batch):
@@ -81,12 +104,9 @@ def collate_fn(batch):
     images = torch.stack(images)
     lengths = torch.tensor(lengths)
 
-    # 1. Input IDs: Pad with EOS
     input_ids = torch.nn.utils.rnn.pad_sequence(
         tokens_list, batch_first=True, padding_value=50256
     )
-
-    # 2. Target Labels
     labels = torch.nn.utils.rnn.pad_sequence(
         tokens_list, batch_first=True, padding_value=-100
     )
