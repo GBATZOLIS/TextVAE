@@ -4,6 +4,9 @@ import torch.optim as optim
 import wandb
 import tiktoken
 from tqdm import tqdm
+import os
+from PIL import Image, ImageDraw, ImageFont
+import torchvision.transforms as transforms
 
 
 class Trainer:
@@ -82,12 +85,9 @@ class Trainer:
             )
             model_inp = torch.cat([sos_token, inp_ids[:, :-1]], dim=1)
 
-            self.optimizer.zero_grad(
-                set_to_none=True
-            )  # Slightly faster than zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
             # --- HPC: Mixed Precision Forward Pass ---
-            # Routes matrix multiplications directly to physical Tensor Cores
             with torch.autocast(
                 device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp
             ):
@@ -129,7 +129,6 @@ class Trainer:
         self.log_predictions(epoch)
         return total_loss / self.config.steps_per_epoch
 
-    # [REST OF TRAINER REMAINS IDENTICAL: unnormalize_image, generate_controlled, evaluate, save, load, draw_text]
     def unnormalize_image(self, tensor):
         mean = torch.tensor([0.485, 0.456, 0.406]).to(self.device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).to(self.device).view(1, 3, 1, 1)
@@ -213,7 +212,11 @@ class Trainer:
             return
         images = images[:num_samples].to(self.device)
         lengths = lengths[:num_samples].to(self.device)
-        generated_ids = self.generate_controlled(images, lengths)
+
+        # Hardcode temperature to 0.7 for automated W&B validation logging to prevent hallucinated sub-words
+        generated_ids = self.generate_controlled(
+            images, lengths, temperature=0.7, top_k=50
+        )
         vis_images = self.unnormalize_image(images)
         wandb_images = []
         for i in range(len(images)):
@@ -253,6 +256,43 @@ class Trainer:
             wandb_images.append(wandb.Image(vis_images[i], caption=caption))
         wandb.log({"Validation Samples": wandb_images, "epoch": epoch})
 
+    def generate_with_custom_length(
+        self,
+        target_length: int,
+        num_samples: int = 8,
+        temperature: float = 1.0,
+        top_k: int = 50,
+    ):
+        self.model.eval()
+        if self.val_loader is None:
+            raise ValueError("Validation loader not available.")
+        images, _, _, _ = next(iter(self.val_loader))
+        images = images[:num_samples].to(self.device)
+        target_lengths = torch.full(
+            (images.size(0),), target_length, dtype=torch.long, device=self.device
+        )
+        generated_ids = self.generate_controlled(
+            images, target_lengths, temperature=temperature, top_k=top_k
+        )
+        results = []
+        for i in range(images.size(0)):
+            tokens = generated_ids[i].tolist()
+            if self.eos_token_id in tokens:
+                eos_idx = tokens.index(self.eos_token_id)
+                tokens = tokens[: eos_idx + 1]
+            text = self.tokenizer.decode(tokens).replace("<|endoftext|>", "")
+            print(f"\nTarget Length: {target_length}")
+            print(f"Actual Length: {len(tokens)}")
+            print(text)
+            results.append(
+                {
+                    "target_length": target_length,
+                    "actual_length": len(tokens),
+                    "text": text,
+                }
+            )
+        return results
+
     def evaluate(self, evaluator, num_batches=None):
         report = evaluator.compute_metrics(num_batches=num_batches)
         if self.config.use_wandb:
@@ -278,3 +318,115 @@ class Trainer:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         print(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
         return checkpoint["epoch"] + 1
+
+    def save_multi_length_visualizations(
+        self,
+        target_lengths=[5, 10, 15, 25, 50],
+        output_dir="multi_length_results",
+        num_images=8,
+        temperature=1.0,
+        top_k=50,
+    ):
+        os.makedirs(output_dir, exist_ok=True)
+        self.model.eval()
+
+        if self.val_loader is None:
+            raise ValueError("Validation loader not available.")
+
+        images, inp_ids, _, gt_lengths = next(iter(self.val_loader))
+
+        images = images[:num_images].to(self.device)
+        inp_ids = inp_ids[:num_images]
+        gt_lengths = gt_lengths[:num_images]
+
+        vis_images = self.unnormalize_image(images).cpu()
+
+        for i in range(images.size(0)):
+            img_tensor = vis_images[i]
+            img = transforms.ToPILImage()(img_tensor)
+            caption_lines = []
+
+            gt_len = gt_lengths[i].item()
+            gt_tokens = inp_ids[i].tolist()[:gt_len]
+            gt_text = self.tokenizer.decode(gt_tokens).replace("<|endoftext|>", "")
+            caption_lines.append("Ground Truth:")
+            caption_lines.append(gt_text)
+            caption_lines.append("")
+
+            for tgt in target_lengths:
+                target_tensor = torch.tensor([tgt], device=self.device)
+                generated_ids = self.generate_controlled(
+                    images[i].unsqueeze(0),
+                    target_tensor,
+                    temperature=temperature,
+                    top_k=top_k,
+                )
+                tokens = generated_ids[0].tolist()
+                if self.eos_token_id in tokens:
+                    eos_idx = tokens.index(self.eos_token_id)
+                    tokens = tokens[: eos_idx + 1]
+
+                text = self.tokenizer.decode(tokens).replace("<|endoftext|>", "")
+                caption_lines.append(f"Target {tgt} (Actual {len(tokens)}):")
+                caption_lines.append(text)
+                caption_lines.append("")
+
+            full_text = "\n".join(caption_lines)
+            nice_img = self.draw_multiline_text_block(img, full_text, font_size=18)
+            save_path = os.path.join(output_dir, f"sample_{i}.jpg")
+            nice_img.save(save_path)
+
+        print(f"\nSaved multi-length visualizations to {output_dir}")
+
+    def draw_multiline_text_block(
+        self, image, text, font_path=None, font_size=18, margin=20, line_spacing=6
+    ):
+        width, height = image.size
+
+        if font_path:
+            font = ImageFont.truetype(font_path, font_size)
+        else:
+            font = ImageFont.load_default()
+
+        draw = ImageDraw.Draw(image)
+        wrapped_lines = []
+        max_width = width - 2 * margin
+
+        for line in text.split("\n"):
+            words = line.split()
+            current_line = ""
+            for word in words:
+                test_line = current_line + (" " if current_line else "") + word
+                bbox = draw.textbbox((0, 0), test_line, font=font)
+                line_width = bbox[2] - bbox[0]
+                if line_width > max_width:
+                    if current_line:
+                        wrapped_lines.append(current_line)
+                    current_line = word
+                else:
+                    current_line = test_line
+            if current_line:
+                wrapped_lines.append(current_line)
+            if not words:
+                wrapped_lines.append("")
+
+        total_text_height = 0
+        line_heights = []
+        for line in wrapped_lines:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            line_height = bbox[3] - bbox[1]
+            total_text_height += line_height + line_spacing
+            line_heights.append(line_height)
+
+        total_text_height += margin
+
+        new_img = Image.new("RGB", (width, height + total_text_height), (255, 255, 255))
+        new_img.paste(image, (0, 0))
+        draw_new = ImageDraw.Draw(new_img)
+
+        y = height + margin
+        for line, lh in zip(wrapped_lines, line_heights):
+            draw_new.text((margin, y), line, fill=(0, 0, 0), font=font)
+            y += lh + line_spacing
+
+        return new_img
