@@ -75,6 +75,9 @@ evaluator = Evaluator(
 )
 
 # You can pass num_batches=10 if you want a quick test instead of the full 500
-report = evaluator.compute_metrics(num_batches=None)
+report = evaluator.compute_metrics(
+    num_batches=None,
+    plot_path="inference_score_vs_length.png",  # <--- Generates the plot here
+)
 print("\nFinal Report:")
 print(report)

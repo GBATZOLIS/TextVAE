@@ -4,6 +4,9 @@ import nltk
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 from nltk.translate.meteor_score import meteor_score
 import numpy as np
+import matplotlib.pyplot as plt
+from collections import defaultdict
+from typing import Dict
 
 required_nltk_packages = ["punkt", "wordnet", "omw-1.4"]
 for pkg in required_nltk_packages:
@@ -21,7 +24,7 @@ class Evaluator:
         self.device = device
         self.eos_token_id = 50256
 
-    def compute_metrics(self, num_batches=None):
+    def compute_metrics(self, num_batches=None, plot_path="score_vs_length.png"):
         self.model.eval()
         all_references = []
         all_hypotheses = []
@@ -127,6 +130,16 @@ class Evaluator:
             smoothing_function=smoothie,
         )
 
+        # Generate plot for scores vs target lengths
+        self._plot_metrics_vs_length(
+            target_lengths,
+            all_references,
+            all_hypotheses,
+            meteor_scores,
+            rouge_scores,
+            plot_path,
+        )
+
         report = {
             "Control_Accuracy": round(accuracy * 100, 2),
             "Control_MAE": round(mae, 4),
@@ -140,6 +153,77 @@ class Evaluator:
         }
 
         return report
+
+    def _plot_metrics_vs_length(
+        self,
+        target_lengths,
+        all_references,
+        all_hypotheses,
+        meteor_scores,
+        rouge_scores,
+        save_path,
+    ):
+        """
+        Groups the samples into bins based on their target length and plots
+        how BLEU, METEOR, and ROUGE change as output length increases.
+        """
+        # Bin size of 10 tokens (e.g. 0-9, 10-19, etc.) for smoother visualization
+        binned_data: Dict = defaultdict(
+            lambda: {"refs": [], "hyps": [], "meteor": [], "rouge": []}
+        )
+
+        for i in range(len(target_lengths)):
+            bin_key = (
+                target_lengths[i] // 10
+            ) * 10 + 5  # Use the center of the bin for the X-axis
+            binned_data[bin_key]["refs"].append(all_references[i])
+            binned_data[bin_key]["hyps"].append(all_hypotheses[i])
+            binned_data[bin_key]["meteor"].append(meteor_scores[i])
+            binned_data[bin_key]["rouge"].append(rouge_scores[i])
+
+        sorted_bins = sorted(binned_data.keys())
+        x_lengths = []
+        y_bleu4 = []
+        y_meteor = []
+        y_rouge = []
+
+        smoothie = SmoothingFunction().method4
+
+        for b in sorted_bins:
+            data = binned_data[b]
+            # Skip bins with fewer than 5 samples to avoid extreme variance noise
+            if len(data["refs"]) < 5:
+                continue
+
+            x_lengths.append(b)
+            y_meteor.append(np.mean(data["meteor"]) * 100)
+            y_rouge.append(np.mean(data["rouge"]) * 100)
+
+            # Calculate corpus BLEU-4 for this specific length bin
+            b4 = corpus_bleu(
+                data["refs"],
+                data["hyps"],
+                weights=(0.25, 0.25, 0.25, 0.25),
+                smoothing_function=smoothie,
+            )
+            y_bleu4.append(b4 * 100)
+
+        if len(x_lengths) > 1:
+            plt.figure(figsize=(10, 6))
+            plt.plot(x_lengths, y_bleu4, marker="o", label="BLEU-4")
+            plt.plot(x_lengths, y_meteor, marker="s", label="METEOR")
+            plt.plot(x_lengths, y_rouge, marker="^", label="ROUGE-L")
+
+            plt.title("Evaluation Scores vs. Target Output Length")
+            plt.xlabel("Target Length (Tokens)")
+            plt.ylabel("Score")
+            plt.grid(True, linestyle="--", alpha=0.7)
+            plt.legend()
+
+            plt.tight_layout()
+            plt.savefig(save_path)
+            plt.close()
+            print(f"Scores vs. Length plot saved to {save_path}")
 
     def calculate_rouge_l(self, reference, hypothesis):
         if not reference or not hypothesis:
