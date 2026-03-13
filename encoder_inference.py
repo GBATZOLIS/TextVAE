@@ -66,7 +66,7 @@ trainer.save_multi_length_visualizations(
     top_k=50,
 )
 
-# 7. Run quantitative evaluation
+# 7. Run quantitative evaluation sweep for the supervisor
 evaluator = Evaluator(
     model=trainer.model,
     loader=trainer.val_loader,
@@ -74,10 +74,12 @@ evaluator = Evaluator(
     device=trainer.config.device,
 )
 
-# You can pass num_batches=10 if you want a quick test instead of the full 500
-report = evaluator.compute_metrics(
-    num_batches=None,
-    plot_path="inference_score_vs_length.png",  # <--- Generates the plot here
+# This tests the exact same batches at every target length and plots it
+length_metrics = evaluator.evaluate_multiple_lengths_and_plot(
+    forced_lengths=[5, 10, 25, 50, 100, 150],
+    num_batches=4,  # Adjust this to test more or fewer images
+    plot_path="supervisor_forced_length_sweep.png",
 )
+
 print("\nFinal Report:")
-print(report)
+print(length_metrics)
