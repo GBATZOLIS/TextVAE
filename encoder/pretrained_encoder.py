@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
-from transformers import GPT2LMHeadModel
+from transformers import GPT2LMHeadModel, Dinov2Model
 from peft import get_peft_model, LoraConfig, TaskType
-
 
 class VisualMapper(nn.Module):
     def __init__(self, visual_dim=1024, gpt_dim=768, dropout=0.1):
@@ -18,7 +17,6 @@ class VisualMapper(nn.Module):
     def forward(self, x):
         return self.proj(x)
 
-
 class CountdownEmbedding(nn.Module):
     def __init__(self, dim, max_len=256):
         super().__init__()
@@ -32,14 +30,13 @@ class CountdownEmbedding(nn.Module):
         distance = torch.clamp(distance, min=0, max=self.max_len)
         return self.embedding(distance)
 
-
 class PlanningGPT2(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
 
-        # 1. Vision: DINOv2 ViT-Large
-        self.vision_encoder = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14")
+        # 1. Vision: DINOv2 ViT-Large (Using HuggingFace instead of torch.hub to fix Py3.9 bug)
+        self.vision_encoder = Dinov2Model.from_pretrained("facebook/dinov2-large")
         for param in self.vision_encoder.parameters():
             param.requires_grad = False
 
@@ -67,8 +64,8 @@ class PlanningGPT2(nn.Module):
         device = images.device
 
         with torch.no_grad():
-            vision_dict = self.vision_encoder.forward_features(images)
-            raw_visual = vision_dict["x_norm_patchtokens"]
+            outputs = self.vision_encoder(pixel_values=images)
+            raw_visual = outputs.last_hidden_state[:, 1:, :]
 
         visual_embeds = self.visual_mapper(raw_visual)
 
