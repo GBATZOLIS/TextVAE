@@ -5,7 +5,8 @@ import torch
 @dataclass
 class EncoderConfig:
     # Data & Paths
-    hf_dataset_path: str = "allenai/PixMo-Cap"
+    hf_dataset_path: str = "allenai/PixMo-Cap"  
+    hf_cache_dir: str = "/rds/user/rg625/hpc-work/hf_cache" # <-- ADD THIS LINE
     img_size: int = 224
     vocab_size: int = 50257
     max_len: int = 256
@@ -15,10 +16,10 @@ class EncoderConfig:
     use_wandb: bool = True
 
     # Training
-    batch_size: int = 128
-    lr: float = 2e-4
+    batch_size: int = 192
+    lr: float = 5e-4
     epochs: int = 100
-    steps_per_epoch: int = 1000
+    steps_per_epoch: int = 2000
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # --- HPC Scaling Optimizations ---

@@ -16,7 +16,11 @@ class StreamingDenseCaptionDataset(IterableDataset):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.dataset = load_dataset(config.hf_dataset_path, split="train", streaming=True)
+        self.dataset = load_dataset(
+            config.hf_dataset_path, 
+            split="train", 
+            cache_dir=config.hf_cache_dir
+        )
         
         self.transform = transforms.Compose([
             transforms.Resize((config.img_size, config.img_size)),

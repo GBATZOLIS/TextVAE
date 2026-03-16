@@ -7,7 +7,7 @@ from tqdm import tqdm
 import os
 from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms as transforms
-
+import torch.distributed as dist
 
 class Trainer:
     def __init__(self, model, train_loader, val_loader, config):
@@ -19,6 +19,10 @@ class Trainer:
 
         self.tokenizer = tiktoken.get_encoding("gpt2")
         self.eos_token_id = 50256
+
+        self.is_distributed = dist.is_initialized()
+        self.is_main_process = (not self.is_distributed) or (dist.get_rank() == 0)
+        self.world_size = dist.get_world_size() if self.is_distributed else 1
 
         # --- HPC: Automatic Mixed Precision (AMP) ---
         self.use_amp = getattr(config, "use_amp", False)
@@ -59,17 +63,20 @@ class Trainer:
         )
 
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
-        if config.use_wandb:
+        
+        if self.is_main_process and config.use_wandb:
             wandb.init(project="planning-autoencoder", config=vars(config))
 
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
-        pbar = tqdm(
-            self.train_loader, desc=f"Epoch {epoch}", total=self.config.steps_per_epoch
-        )
+        
+        if self.is_main_process:
+            iterator = tqdm(self.train_loader, desc=f"Epoch {epoch}", total=self.config.steps_per_epoch)
+        else:
+            iterator = self.train_loader
 
-        for step, (images, inp_ids, labels, lengths) in enumerate(pbar):
+        for step, (images, inp_ids, labels, lengths) in enumerate(iterator):
             if step >= self.config.steps_per_epoch:
                 break
 
@@ -108,26 +115,33 @@ class Trainer:
             self.scheduler.step()
 
             total_loss += loss.item()
-            lrs = self.scheduler.get_last_lr()
-            pbar.set_postfix({"loss": loss.item(), "lr_gpt": lrs[0], "lr_vis": lrs[1]})
 
-            # Throttle W&B logging to prevent I/O blocking
-            if self.config.use_wandb and step % 50 == 0:
-                wandb.log(
-                    {
-                        "train_loss": loss.item(),
-                        "lr_gpt": lrs[0],
-                        "lr_vis": lrs[1],
-                        "global_step": epoch * self.config.steps_per_epoch + step,
-                    }
-                )
+            if self.is_main_process:
+                iterator.set_postfix({"loss": loss.item()})
+                
+                # if step % 500 == 0 and self.config.use_wandb:
+                lrs = self.scheduler.get_last_lr()
+                wandb.log({
+                    "train_loss": loss.item(),
+                    "lr_gpt": lrs[0],
+                    "lr_vis": lrs[1],
+                    "global_step": epoch * self.config.steps_per_epoch + step,
+                })
 
-            if step > 0 and step % 1000 == 0:
-                self.log_predictions(f"{epoch}_step_{step}")
-                self.model.train()
+                if step > 0 and step % 1000 == 0:
+                    self.log_predictions(f"{epoch}_step_{step}")
+                    self.model.train() # Ensure it goes back to train mode!
 
         self.log_predictions(epoch)
-        return total_loss / self.config.steps_per_epoch
+
+        if self.is_distributed:
+            loss_tensor = torch.tensor([total_loss], device=self.device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            total_loss = loss_tensor.item()
+        
+        avg_loss = total_loss / (self.config.steps_per_epoch * dist.get_world_size())
+        
+        return avg_loss
 
     def unnormalize_image(self, tensor):
         mean = torch.tensor([0.485, 0.456, 0.406]).to(self.device).view(1, 3, 1, 1)
@@ -140,10 +154,14 @@ class Trainer:
         self.model.eval()
         B = images.shape[0]
         device = self.device
+        model_ptr = self.model.module if hasattr(self.model, "module") else self.model
+    
         with torch.no_grad():
-            vision_dict = self.model.vision_encoder.forward_features(images)
-            raw_visual = vision_dict["x_norm_patchtokens"]
-            visual_embeds = self.model.visual_mapper(raw_visual)
+            # Use model_ptr instead of self.model
+            outputs = model_ptr.vision_encoder(pixel_values=images)
+            raw_visual = outputs.last_hidden_state[:, 1:, :]
+            visual_embeds = model_ptr.visual_mapper(raw_visual)
+
         input_ids = torch.full(
             (B, 1), self.eos_token_id, dtype=torch.long, device=device
         )
@@ -159,16 +177,15 @@ class Trainer:
                 else:
                     new_token_ids = input_ids[:, -1:]
                     positions = current_lengths.unsqueeze(1)
-                word_embeds = self.model.gpt2.base_model.model.transformer.wte(
-                    new_token_ids
-                )
-                count_embeds = self.model.countdown_emb(positions, target_lengths)
+                word_embeds = model_ptr.gpt2.base_model.model.transformer.wte(new_token_ids)
+                count_embeds = model_ptr.countdown_emb(positions, target_lengths)
+                
                 text_embeds = word_embeds + count_embeds
                 if past_key_values is None:
                     inputs_embeds = torch.cat([visual_embeds, text_embeds], dim=1)
                 else:
                     inputs_embeds = text_embeds
-                outputs = self.model.gpt2(
+                outputs = model_ptr.gpt2(
                     inputs_embeds=inputs_embeds,
                     past_key_values=past_key_values,
                     use_cache=True,
@@ -203,8 +220,9 @@ class Trainer:
         return input_ids[:, 1:]
 
     def log_predictions(self, epoch, num_samples=4):
-        if not self.config.use_wandb:
+        if not self.is_main_process or not self.config.use_wandb:
             return
+            
         loader = self.val_loader if self.val_loader is not None else self.train_loader
         try:
             images, inp_ids, _, lengths = next(iter(loader))
@@ -301,9 +319,10 @@ class Trainer:
         return report
 
     def save(self, path, epoch):
+        model_to_save = self.model.module if hasattr(self.model, "module") else self.model
         checkpoint = {
             "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": model_to_save.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "config": vars(self.config),
