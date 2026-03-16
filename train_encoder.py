@@ -67,13 +67,20 @@ def main_worker(local_rank, world_size, args):
     val_ds = StreamingDenseCaptionDataset(config)
     train_ds = StreamingDenseCaptionDataset(config)
 
-    val_ds.dataset = val_ds.dataset.take(500)
-    
     images_to_skip = 500 + (start_epoch * config.steps_per_epoch * config.batch_size * world_size)
-    
     if local_rank == 0: 
         print(f"Fast-forwarding stream by {images_to_skip:,} images...")
-    train_ds.dataset = train_ds.dataset.skip(images_to_skip)
+
+    # --- HPC FIX: Handle both Streaming and Local Datasets safely ---
+    if hasattr(val_ds.dataset, "take"):
+        # Streaming Mode (from the internet)
+        val_ds.dataset = val_ds.dataset.take(500)
+        train_ds.dataset = train_ds.dataset.skip(images_to_skip)
+    else:
+        # Local Download Mode (from HPC NVMe disk)
+        val_ds.dataset = val_ds.dataset.select(range(500))
+        safe_skip = min(images_to_skip, len(train_ds.dataset) - 1)
+        train_ds.dataset = train_ds.dataset.select(range(safe_skip, len(train_ds.dataset)))
 
     # --- SHARD DATASET TO PREVENT GPUs FROM DOING DUPLICATE WORK ---
     if hasattr(train_ds.dataset, "shard"):
