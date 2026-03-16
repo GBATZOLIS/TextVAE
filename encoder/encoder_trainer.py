@@ -8,6 +8,8 @@ import os
 from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms as transforms
 import torch.distributed as dist
+from transformers import DynamicCache
+
 
 class Trainer:
     def __init__(self, model, train_loader, val_loader, config):
@@ -63,28 +65,35 @@ class Trainer:
         )
 
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
-        
+
         if self.is_main_process and config.use_wandb:
             wandb.init(project="planning-autoencoder", config=vars(config))
 
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
-        
+
         if self.is_main_process:
-            iterator = tqdm(self.train_loader, desc=f"Epoch {epoch}", total=self.config.steps_per_epoch)
+            iterator = tqdm(
+                self.train_loader,
+                desc=f"Epoch {epoch}",
+                total=self.config.steps_per_epoch,
+            )
         else:
             iterator = self.train_loader
 
-        for step, (images, inp_ids, labels, lengths) in enumerate(iterator):
+        # FIX: Catch the 5th item (attention_mask)
+        for step, (images, inp_ids, labels, lengths, attention_mask) in enumerate(
+            iterator
+        ):
             if step >= self.config.steps_per_epoch:
                 break
 
-            # non_blocking=True allows async transfer while CPU prepares the next batch
             images = images.to(self.device, non_blocking=True)
             inp_ids = inp_ids.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
             lengths = lengths.to(self.device, non_blocking=True)
+            attention_mask = attention_mask.to(self.device, non_blocking=True)
 
             B = inp_ids.shape[0]
             sos_token = torch.full(
@@ -92,13 +101,19 @@ class Trainer:
             )
             model_inp = torch.cat([sos_token, inp_ids[:, :-1]], dim=1)
 
+            # FIX: Shift the mask exactly like the input_ids, prepending a '1' for the SOS token
+            sos_mask = torch.ones((B, 1), dtype=torch.long, device=self.device)
+            model_mask = torch.cat([sos_mask, attention_mask[:, :-1]], dim=1)
+
             self.optimizer.zero_grad(set_to_none=True)
 
-            # --- HPC: Mixed Precision Forward Pass ---
             with torch.autocast(
                 device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp
             ):
-                logits = self.model(images, model_inp, lengths)
+                # FIX: Pass the mask into the model
+                logits = self.model(
+                    images, model_inp, lengths, attention_mask=model_mask
+                )
                 loss = self.criterion(
                     logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
                 )
@@ -118,19 +133,21 @@ class Trainer:
 
             if self.is_main_process:
                 iterator.set_postfix({"loss": loss.item()})
-                
+
                 # if step % 500 == 0 and self.config.use_wandb:
                 lrs = self.scheduler.get_last_lr()
-                wandb.log({
-                    "train_loss": loss.item(),
-                    "lr_gpt": lrs[0],
-                    "lr_vis": lrs[1],
-                    "global_step": epoch * self.config.steps_per_epoch + step,
-                })
+                wandb.log(
+                    {
+                        "train_loss": loss.item(),
+                        "lr_gpt": lrs[0],
+                        "lr_vis": lrs[1],
+                        "global_step": epoch * self.config.steps_per_epoch + step,
+                    }
+                )
 
                 if step > 0 and step % 1000 == 0:
                     self.log_predictions(f"{epoch}_step_{step}")
-                    self.model.train() # Ensure it goes back to train mode!
+                    self.model.train()  # Ensure it goes back to train mode!
 
         self.log_predictions(epoch)
 
@@ -138,9 +155,9 @@ class Trainer:
             loss_tensor = torch.tensor([total_loss], device=self.device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
             total_loss = loss_tensor.item()
-        
+
         avg_loss = total_loss / (self.config.steps_per_epoch * dist.get_world_size())
-        
+
         return avg_loss
 
     def unnormalize_image(self, tensor):
@@ -155,11 +172,10 @@ class Trainer:
         B = images.shape[0]
         device = self.device
         model_ptr = self.model.module if hasattr(self.model, "module") else self.model
-    
+
         with torch.no_grad():
-            # Use model_ptr instead of self.model
             outputs = model_ptr.vision_encoder(pixel_values=images)
-            raw_visual = outputs.last_hidden_state[:, 1:, :]
+            raw_visual = outputs.last_hidden_state
             visual_embeds = model_ptr.visual_mapper(raw_visual)
 
         input_ids = torch.full(
@@ -169,6 +185,11 @@ class Trainer:
         finished = torch.zeros(B, dtype=torch.bool, device=device)
         past_key_values = None
 
+        # FIX: Initialize the attention mask for the 32 visual tokens + 1 SOS token
+        attention_mask = torch.ones(
+            (B, model_ptr.num_visual_queries + 1), dtype=torch.long, device=device
+        )
+
         while not finished.all():
             with torch.no_grad():
                 if past_key_values is None:
@@ -177,21 +198,34 @@ class Trainer:
                 else:
                     new_token_ids = input_ids[:, -1:]
                     positions = current_lengths.unsqueeze(1)
-                word_embeds = model_ptr.gpt2.base_model.model.transformer.wte(new_token_ids)
+
+                word_embeds = model_ptr.gpt2.base_model.model.transformer.wte(
+                    new_token_ids
+                )
+                wpe = model_ptr.gpt2.base_model.model.transformer.wpe(positions)
                 count_embeds = model_ptr.countdown_emb(positions, target_lengths)
-                
-                text_embeds = word_embeds + count_embeds
+
+                text_embeds = word_embeds + wpe + count_embeds
+
                 if past_key_values is None:
                     inputs_embeds = torch.cat([visual_embeds, text_embeds], dim=1)
                 else:
                     inputs_embeds = text_embeds
+
                 outputs = model_ptr.gpt2(
                     inputs_embeds=inputs_embeds,
-                    past_key_values=past_key_values,
+                    attention_mask=attention_mask,  # FIX: Pass the mask!
+                    past_key_values=(
+                        DynamicCache.from_legacy_cache(past_key_values)
+                        if past_key_values is not None
+                        else None
+                    ),
                     use_cache=True,
                 )
+
                 past_key_values = outputs.past_key_values
                 next_token_logits = outputs.logits[:, -1, :]
+
                 if repetition_penalty != 1.0:
                     for i in range(B):
                         unique_tokens = torch.unique(input_ids[i])
@@ -204,28 +238,39 @@ class Trainer:
                                 selected_logits * repetition_penalty,
                                 selected_logits / repetition_penalty,
                             )
+
                 next_token_logits = next_token_logits / temperature
                 if top_k > 0:
                     top_k_probs, _ = torch.topk(next_token_logits, top_k)
                     min_val = top_k_probs[:, -1].unsqueeze(-1)
                     next_token_logits[next_token_logits < min_val] = float("-inf")
+
                 probs = torch.softmax(next_token_logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+
             next_token = torch.where(
                 finished, torch.full_like(next_token, self.eos_token_id), next_token
             )
             input_ids = torch.cat([input_ids, next_token.unsqueeze(1)], dim=1)
+
+            # FIX: Grow the attention mask by 1 for the newly generated token
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones((B, 1), dtype=torch.long, device=device)],
+                dim=1,
+            )
+
             current_lengths += (~finished).long()
             finished = current_lengths >= target_lengths
+
         return input_ids[:, 1:]
 
     def log_predictions(self, epoch, num_samples=4):
         if not self.is_main_process or not self.config.use_wandb:
             return
-            
+
         loader = self.val_loader if self.val_loader is not None else self.train_loader
         try:
-            images, inp_ids, _, lengths = next(iter(loader))
+            images, inp_ids, _, lengths, _ = next(iter(loader))
         except StopIteration:
             return
         images = images[:num_samples].to(self.device)
@@ -284,7 +329,9 @@ class Trainer:
         self.model.eval()
         if self.val_loader is None:
             raise ValueError("Validation loader not available.")
-        images, _, _, _ = next(iter(self.val_loader))
+        # Use *_ to robustly catch however many items are left
+        batch = next(iter(self.val_loader))
+        images = batch[0]
         images = images[:num_samples].to(self.device)
         target_lengths = torch.full(
             (images.size(0),), target_length, dtype=torch.long, device=self.device
@@ -319,7 +366,9 @@ class Trainer:
         return report
 
     def save(self, path, epoch):
-        model_to_save = self.model.module if hasattr(self.model, "module") else self.model
+        model_to_save = (
+            self.model.module if hasattr(self.model, "module") else self.model
+        )
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": model_to_save.state_dict(),
@@ -331,7 +380,7 @@ class Trainer:
 
     def load(self, path):
         checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -352,7 +401,8 @@ class Trainer:
         if self.val_loader is None:
             raise ValueError("Validation loader not available.")
 
-        images, inp_ids, _, gt_lengths = next(iter(self.val_loader))
+        # Catch the 5th item
+        images, inp_ids, _, gt_lengths, _ = next(iter(self.val_loader))
 
         images = images[:num_images].to(self.device)
         inp_ids = inp_ids[:num_images]

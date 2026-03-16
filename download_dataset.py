@@ -2,7 +2,7 @@ import os
 from datasets import load_dataset
 
 # 1. Force Hugging Face to use your high-capacity HPC workspace
-cache_dir = "/rds/user/rg625/hpc-work/hf_cache"
+cache_dir = "~/datasets/hf_cache"
 os.makedirs(cache_dir, exist_ok=True)
 os.environ["HF_HOME"] = cache_dir
 os.environ["HF_DATASETS_CACHE"] = cache_dir

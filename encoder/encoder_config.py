@@ -1,28 +1,44 @@
-from dataclasses import dataclass
+import os
 import torch
+from dataclasses import dataclass, field
 
 
 @dataclass
 class EncoderConfig:
     # Data & Paths
-    hf_dataset_path: str = "allenai/PixMo-Cap"  
-    hf_cache_dir: str = "/rds/user/rg625/hpc-work/hf_cache" # <-- ADD THIS LINE
-    img_size: int = 224
+    hf_dataset_path: str = "allenai/PixMo-Cap"
+    # Explicitly define the absolute path or expand the user directory safely
+    hf_cache_dir: str = field(
+        default_factory=lambda: os.path.expanduser("/home/rg625/datasets/hf_cache")
+    )
+
+    # SOTA Fix: Bumped resolution for dense captioning grounding
+    # DINOv2 patch size is 14. 336 / 14 = 24. (24x24 = 576 patches)
+    img_size: int = 448
     vocab_size: int = 50257
-    max_len: int = 256
+    max_len: int = 512
 
     # Checkpoint / Logging
     save_dir: str = "./checkpoints"
     use_wandb: bool = True
 
     # Training
-    batch_size: int = 192
-    lr: float = 5e-4
+    batch_size: int = 16
+    lr: float = 2e-4
     epochs: int = 100
-    steps_per_epoch: int = 2000
+    steps_per_epoch: int = 5000
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # --- HPC Scaling Optimizations ---
-    use_amp: bool = True  # Automatic Mixed Precision (BFloat16/FP16)
-    num_workers: int = 4  # Parallel CPU workers for downloading data
-    prefetch_factor: int = 2  # Pre-load batches into RAM ahead of the GPU
+    use_amp: bool = True
+
+    # SOTA Fix: Massive worker bump to prevent HTTP blocking from starving the GPU
+    num_workers: int = 16
+
+    # Bump prefetch so the RAM buffer absorbs network latency spikes
+    prefetch_factor: int = 4
+
+    def __post_init__(self):
+        # Safety check to ensure paths exist
+        os.makedirs(self.hf_cache_dir, exist_ok=True)
+        os.makedirs(self.save_dir, exist_ok=True)

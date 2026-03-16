@@ -15,13 +15,20 @@ from encoder.pretrained_encoder import PlanningGPT2
 from encoder.encoder_trainer import Trainer
 from encoder.encoder_eval import Evaluator
 
+# FIX: Prevent C-level dataloader aborts by switching the sharing strategy
+# Add this near the top of train_encoder.py, right after the imports!
+import torch.multiprocessing
+
+torch.multiprocessing.set_sharing_strategy("file_system")
 # --- HPC: ENABLING TENSORFLOAT32 (TF32) ---
 torch.set_float32_matmul_precision("high")
+
 
 def set_seed(seed: int = 42):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
 
 def build_config_from_args(args) -> EncoderConfig:
     config = EncoderConfig()
@@ -30,23 +37,26 @@ def build_config_from_args(args) -> EncoderConfig:
             setattr(config, key, value)
     return config
 
+
 # ==========================================
 # Worker Function for each GPU
 # ==========================================
 def main_worker(local_rank, world_size, args):
     # 1. Manually set environment variables for DDP
-    os.environ['MASTER_ADDR'] = '127.0.0.1' # Loopback explicitly prevents resolving issues
-    os.environ['MASTER_PORT'] = '12355'
+    os.environ["MASTER_ADDR"] = (
+        "127.0.0.1"  # Loopback explicitly prevents resolving issues
+    )
+    os.environ["MASTER_PORT"] = "12355"
 
     # 2. Initialize process group
     dist.init_process_group(backend="nccl", rank=local_rank, world_size=world_size)
-    
+
     # Lock this specific process to a specific GPU
     torch.cuda.set_device(local_rank)
 
     # Offset the seed by the local rank so each GPU augments data differently
     set_seed(args.seed + local_rank)
-    
+
     config = build_config_from_args(args)
     # CRITICAL: Tell your config to use this specific GPU so the Trainer moves tensors correctly
     config.device = torch.device(f"cuda:{local_rank}")
@@ -63,15 +73,17 @@ def main_worker(local_rank, world_size, args):
         checkpoint = torch.load(args.resume, map_location="cpu")
         start_epoch = checkpoint["epoch"] + 1
 
-    if local_rank == 0: print("Initializing Streaming Datasets...")
+    if local_rank == 0:
+        print("Initializing Streaming Datasets...")
     val_ds = StreamingDenseCaptionDataset(config)
     train_ds = StreamingDenseCaptionDataset(config)
 
-    images_to_skip = 500 + (start_epoch * config.steps_per_epoch * config.batch_size * world_size)
-    if local_rank == 0: 
+    images_to_skip = 500 + (
+        start_epoch * config.steps_per_epoch * config.batch_size * world_size
+    )
+    if local_rank == 0:
         print(f"Fast-forwarding stream by {images_to_skip:,} images...")
 
-    # --- HPC FIX: Handle both Streaming and Local Datasets safely ---
     if hasattr(val_ds.dataset, "take"):
         # Streaming Mode (from the internet)
         val_ds.dataset = val_ds.dataset.take(500)
@@ -80,20 +92,28 @@ def main_worker(local_rank, world_size, args):
         # Local Download Mode (from HPC NVMe disk)
         val_ds.dataset = val_ds.dataset.select(range(500))
         safe_skip = min(images_to_skip, len(train_ds.dataset) - 1)
-        train_ds.dataset = train_ds.dataset.select(range(safe_skip, len(train_ds.dataset)))
+        train_ds.dataset = train_ds.dataset.select(
+            range(safe_skip, len(train_ds.dataset))
+        )
 
     # --- SHARD DATASET TO PREVENT GPUs FROM DOING DUPLICATE WORK ---
     if hasattr(train_ds.dataset, "shard"):
-        train_ds.dataset = train_ds.dataset.shard(num_shards=world_size, index=local_rank)
+        train_ds.dataset = train_ds.dataset.shard(
+            num_shards=world_size, index=local_rank
+        )
         if local_rank == 0:
             print(f"Successfully sharded stream across {world_size} GPUs.")
 
     # --- NEW: CALCULATE PER-GPU BATCH SIZE ---
-    assert config.batch_size % world_size == 0, f"Global batch size {config.batch_size} must be divisible by {world_size} GPUs."
+    assert (
+        config.batch_size % world_size == 0
+    ), f"Global batch size {config.batch_size} must be divisible by {world_size} GPUs."
     per_device_batch_size = config.batch_size // world_size
-    
+
     if local_rank == 0:
-        print(f"Global Batch Size: {config.batch_size} | Per-GPU Batch Size: {per_device_batch_size}")
+        print(
+            f"Global Batch Size: {config.batch_size} | Per-GPU Batch Size: {per_device_batch_size}"
+        )
 
     train_loader = DataLoader(
         train_ds,
@@ -125,7 +145,7 @@ def main_worker(local_rank, world_size, args):
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     trainer = Trainer(model, train_loader, val_loader, config)
-    
+
     if args.resume is not None:
         trainer.load(args.resume)
 
@@ -134,6 +154,7 @@ def main_worker(local_rank, world_size, args):
         loader=trainer.val_loader,
         tokenizer=trainer.tokenizer,
         device=trainer.device,
+        generate_fn=trainer.generate_controlled,  # <-- Add this line
     )
 
     if args.inference_only:
@@ -149,14 +170,14 @@ def main_worker(local_rank, world_size, args):
     # 3. DISTRIBUTED TRAINING LOOP
     for epoch in range(start_epoch, config.epochs):
         avg_loss = trainer.train_epoch(epoch)
-        
+
         if local_rank == 0:
             print(f"\n--- Epoch {epoch} Evaluation ---")
             _ = trainer.evaluate(evaluator, num_batches=None)
             print(f"Epoch {epoch} | Loss: {avg_loss:.4f}")
             save_path = os.path.join(config.save_dir, f"model_epoch_{epoch+1}.pt")
             trainer.save(save_path, epoch=epoch)
-            
+
         dist.barrier()
 
     dist.destroy_process_group()
@@ -177,15 +198,16 @@ def main():
 
     # Detect how many GPUs Slurm actually gave us
     world_size = torch.cuda.device_count()
-    
+
     if world_size < 2:
         print(f"WARNING: Found {world_size} GPU(s). DDP is meant for 2+ GPUs.")
         print("If you meant to use 1 GPU, just run this normally without DDP wrappers.")
 
     print(f"Spawning {world_size} processes for DDP...")
-    
+
     # This launches main_worker() on 'world_size' number of GPUs
     mp.spawn(main_worker, nprocs=world_size, args=(world_size, args))
+
 
 if __name__ == "__main__":
     main()
