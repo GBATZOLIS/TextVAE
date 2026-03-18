@@ -25,49 +25,21 @@ class Trainer:
         self.is_main_process = (not self.is_distributed) or (dist.get_rank() == 0)
         self.world_size = dist.get_world_size() if self.is_distributed else 1
 
-        # --- HPC: Automatic Mixed Precision (AMP) ---
         self.use_amp = getattr(config, "use_amp", False)
-        # Use BFloat16 if available (Ampere A100s natively support this perfectly), else Float16
         self.amp_dtype = (
             torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         )
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
-        high_lr_params = []
-        low_lr_params = []
-
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if "visual_mapper" in name or "countdown_emb" in name:
-                high_lr_params.append(param)
-            else:
-                low_lr_params.append(param)
-
         base_lr = config.lr
-
-        # optimizer_grouped_parameters = [
-        #     {"params": low_lr_params, "lr": base_lr},
-        #     {"params": high_lr_params, "lr": base_lr * 10},
-        # ]
-
-        # self.optimizer = optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
         self.optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.01)
 
         total_steps = config.steps_per_epoch * config.epochs
-        # self.scheduler = optim.lr_scheduler.OneCycleLR(
-        #     self.optimizer,
-        #     max_lr=[base_lr, base_lr * 10],
-        #     total_steps=total_steps,
-        #     pct_start=0.1,
-        #     div_factor=10,
-        #     final_div_factor=100,
-        # )
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=base_lr,  # Removed the * 10 multiplier
+            max_lr=base_lr,
             total_steps=total_steps,
-            pct_start=0.05,  # Quicker warmup
+            pct_start=0.05,
             div_factor=10,
             final_div_factor=100,
         )
@@ -90,7 +62,6 @@ class Trainer:
         else:
             iterator = self.train_loader
 
-        # FIX: Catch the 5th item (attention_mask)
         for step, (images, inp_ids, labels, lengths, attention_mask) in enumerate(
             iterator
         ):
@@ -109,7 +80,6 @@ class Trainer:
             )
             model_inp = torch.cat([sos_token, inp_ids[:, :-1]], dim=1)
 
-            # FIX: Shift the mask exactly like the input_ids, prepending a '1' for the SOS token
             sos_mask = torch.ones((B, 1), dtype=torch.long, device=self.device)
             model_mask = torch.cat([sos_mask, attention_mask[:, :-1]], dim=1)
 
@@ -118,7 +88,7 @@ class Trainer:
             with torch.autocast(
                 device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp
             ):
-                # FIX: Pass the mask into the model
+                # The forward pass now handles the cross-attention internally
                 logits = self.model(
                     images, model_inp, lengths, attention_mask=model_mask
                 )
@@ -126,13 +96,9 @@ class Trainer:
                     logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
                 )
 
-            # --- HPC: Scaled Backward Pass ---
             self.scaler.scale(loss).backward()
-
-            # Unscale before clipping gradients
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.scheduler.step()
@@ -141,21 +107,18 @@ class Trainer:
 
             if self.is_main_process:
                 iterator.set_postfix({"loss": loss.item()})
-
-                # if step % 500 == 0 and self.config.use_wandb:
                 lrs = self.scheduler.get_last_lr()
                 wandb.log(
                     {
                         "train_loss": loss.item(),
                         "lr_gpt": lrs[0],
-                        # "lr_vis": lrs[1],
                         "global_step": epoch * self.config.steps_per_epoch + step,
                     }
                 )
 
                 if step > 0 and step % 1000 == 0:
                     self.log_predictions(f"{epoch}_step_{step}")
-                    self.model.train()  # Ensure it goes back to train mode!
+                    self.model.train()
 
         self.log_predictions(epoch)
 
@@ -165,7 +128,6 @@ class Trainer:
             total_loss = loss_tensor.item()
 
         avg_loss = total_loss / (self.config.steps_per_epoch * dist.get_world_size())
-
         return avg_loss
 
     def unnormalize_image(self, tensor):
@@ -174,7 +136,13 @@ class Trainer:
         return torch.clamp(tensor * std + mean, 0, 1)
 
     def generate_controlled(
-        self, images, target_lengths, temperature=1.0, top_k=50, repetition_penalty=1.2
+        self,
+        images,
+        target_lengths,
+        temperature=1.0,
+        top_k=50,
+        repetition_penalty=1.2,
+        cfg_scale=1.0,
     ):
         self.model.eval()
         B = images.shape[0]
@@ -183,51 +151,76 @@ class Trainer:
 
         with torch.no_grad():
             outputs = model_ptr.vision_encoder(pixel_values=images)
-            raw_visual = outputs.last_hidden_state[:, 1:, :]  # 256 patches
+            raw_visual = outputs.last_hidden_state[:, 1:, :]
             visual_embeds = model_ptr.visual_mapper(raw_visual)
+
+            if cfg_scale > 1.0:
+                uncond_visual_embeds = torch.zeros_like(visual_embeds)
 
         input_ids = torch.full(
             (B, 1), self.eos_token_id, dtype=torch.long, device=device
         )
         current_lengths = torch.zeros(B, dtype=torch.long, device=device)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
+
         past_key_values = None
+        past_key_values_cond = None
+        past_key_values_uncond = None
 
         while not finished.all():
             with torch.no_grad():
-                # 1. Setup the current token and countdown position
-                if past_key_values is None:
+                if (past_key_values is None) and (past_key_values_cond is None):
                     new_token_ids = input_ids
                     positions = torch.zeros((B, 1), dtype=torch.long, device=device)
                 else:
                     new_token_ids = input_ids[:, -1:]
                     positions = current_lengths.unsqueeze(1)
 
-                # 2. Get embeddings
                 word_embeds = model_ptr.gpt2.base_model.model.transformer.wte(
                     new_token_ids
                 )
                 count_embeds = model_ptr.countdown_emb(positions, target_lengths)
-                text_embeds = word_embeds + count_embeds
 
-                # 3. Concatenate visuals only on the very first step
-                if past_key_values is None:
-                    inputs_embeds = torch.cat([visual_embeds, text_embeds], dim=1)
+                # NO CONCATENATION. Inputs are strictly text + countdown.
+                inputs_embeds = word_embeds + count_embeds
+
+                if cfg_scale > 1.0:
+                    # 1. Conditioned Pass (with image)
+                    outputs_cond = model_ptr.gpt2(
+                        inputs_embeds=inputs_embeds,
+                        past_key_values=past_key_values_cond,
+                        encoder_hidden_states=visual_embeds,
+                        use_cache=True,
+                    )
+                    # 2. Unconditioned Pass (blind / zeroes)
+                    outputs_uncond = model_ptr.gpt2(
+                        inputs_embeds=inputs_embeds,
+                        past_key_values=past_key_values_uncond,
+                        encoder_hidden_states=uncond_visual_embeds,
+                        use_cache=True,
+                    )
+
+                    past_key_values_cond = outputs_cond.past_key_values
+                    past_key_values_uncond = outputs_uncond.past_key_values
+
+                    logits_cond = outputs_cond.logits[:, -1, :]
+                    logits_uncond = outputs_uncond.logits[:, -1, :]
+
+                    # 3. Apply Classifier-Free Guidance Extrapolation
+                    next_token_logits = logits_uncond + cfg_scale * (
+                        logits_cond - logits_uncond
+                    )
                 else:
-                    inputs_embeds = text_embeds
+                    # Standard Single Pass
+                    outputs = model_ptr.gpt2(
+                        inputs_embeds=inputs_embeds,
+                        past_key_values=past_key_values,
+                        encoder_hidden_states=visual_embeds,
+                        use_cache=True,
+                    )
+                    past_key_values = outputs.past_key_values
+                    next_token_logits = outputs.logits[:, -1, :]
 
-                # 4. THE FIX: Strip out the manual attention_mask and position_ids.
-                # Let Hugging Face handle the KV-cache incrementing automatically.
-                outputs = model_ptr.gpt2(
-                    inputs_embeds=inputs_embeds,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-
-                past_key_values = outputs.past_key_values
-                next_token_logits = outputs.logits[:, -1, :]
-
-                # 5. Apply Repetition Penalty
                 if repetition_penalty != 1.0:
                     for i in range(B):
                         unique_tokens = torch.unique(input_ids[i])
@@ -241,16 +234,15 @@ class Trainer:
                                 selected_logits / repetition_penalty,
                             )
 
-                # 6. Sample the next token
                 next_token_logits = next_token_logits / temperature
                 if top_k > 0:
                     top_k_probs, _ = torch.topk(next_token_logits, top_k)
                     min_val = top_k_probs[:, -1].unsqueeze(-1)
                     next_token_logits[next_token_logits < min_val] = float("-inf")
+
                 probs = torch.softmax(next_token_logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
 
-                # 7. Check completion
                 next_token = torch.where(
                     finished, torch.full_like(next_token, self.eos_token_id), next_token
                 )

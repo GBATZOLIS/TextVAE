@@ -14,17 +14,17 @@ class EncoderConfig:
 
     # SOTA Fix: Bumped resolution for dense captioning grounding
     # DINOv2 patch size is 14. 336 / 14 = 24. (24x24 = 576 patches)
-    img_size: int = 448
+    img_size: int = 224
     vocab_size: int = 50257
-    max_len: int = 512
+    max_len: int = 256
 
     # Checkpoint / Logging
-    save_dir: str = "./checkpoints"
+    save_dir: str = "./encoder_checkpoints"
     use_wandb: bool = True
 
     # Training
     batch_size: int = 16
-    lr: float = 2e-4
+    lr: float = 5e-4
     epochs: int = 100
     steps_per_epoch: int = 5000
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

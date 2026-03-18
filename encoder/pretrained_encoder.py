@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import GPT2LMHeadModel, Dinov2Model
+from transformers import GPT2LMHeadModel, GPT2Config, Dinov2Model
 from peft import get_peft_model, LoraConfig, TaskType
 
 
@@ -43,18 +43,29 @@ class PlanningGPT2(nn.Module):
         for param in self.vision_encoder.parameters():
             param.requires_grad = False
 
-        # 2. Visual Mapper: Your exact Linear/GELU setup
+        # 2. Visual Mapper
         self.visual_mapper = VisualMapper(visual_dim=1024, gpt_dim=768)
 
-        # 3. Language: GPT-2 via High-Capacity LoRA
-        base_gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
+        # 3. Language: GPT-2 with Cross-Attention Enabled
+        gpt2_config = GPT2Config.from_pretrained("gpt2")
+        gpt2_config.add_cross_attention = (
+            True  # THE FIX: Injects cross-attention into every block
+        )
+
+        # Load base model (ignore_mismatched_sizes is needed because the new cross-attention weights are randomly initialized)
+        base_gpt2 = GPT2LMHeadModel.from_pretrained(
+            "gpt2", config=gpt2_config, ignore_mismatched_sizes=True
+        )
+
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
-            r=64,  # UPGRADE: 4x the adapter capacity
+            r=64,
             lora_alpha=128,
             lora_dropout=0.1,
-            target_modules=["c_attn", "c_proj", "c_fc"],  # UPGRADE: Target the MLPs
+            target_modules=["c_attn", "c_proj", "c_fc"],
+            # THE FIX: Tell PEFT to keep the newly initialized cross-attention layers fully trainable
+            modules_to_save=["crossattention"],
             fan_in_fan_out=True,
         )
         self.gpt2 = get_peft_model(base_gpt2, peft_config)
@@ -68,7 +79,6 @@ class PlanningGPT2(nn.Module):
 
         with torch.no_grad():
             outputs = self.vision_encoder(pixel_values=images)
-            # Keeping the 256 patches matching your original spatial grid
             raw_visual = outputs.last_hidden_state[:, 1:, :]
 
         visual_embeds = self.visual_mapper(raw_visual)
@@ -77,37 +87,20 @@ class PlanningGPT2(nn.Module):
         positions = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
         count_embeds = self.countdown_emb(positions, target_lengths)
 
+        # NO MORE CONCATENATION. Text is its own pure sequence.
         text_inputs_embeds = word_embeds + count_embeds
-        combined_embeds = torch.cat([visual_embeds, text_inputs_embeds], dim=1)
 
-        # UPGRADE: Robust Padding Mask
         if attention_mask is None:
-            text_mask = torch.ones((B, L), dtype=torch.long, device=device)
-        else:
-            text_mask = attention_mask
+            attention_mask = torch.ones((B, L), dtype=torch.long, device=device)
 
-        visual_mask = torch.ones((B, 256), dtype=torch.long, device=device)
-        full_attention_mask = torch.cat([visual_mask, text_mask], dim=1)
-
-        # UPGRADE: Explicit Positional Lockdown
-        # Visual tokens get positions 0 to 255. Text gets 256 onward.
-        # This perfectly mimics your successful run but makes it bulletproof.
-        visual_positions = (
-            torch.arange(0, 256, dtype=torch.long, device=device)
-            .unsqueeze(0)
-            .expand(B, -1)
-        )
-        text_positions = (
-            torch.arange(256, 256 + L, dtype=torch.long, device=device)
-            .unsqueeze(0)
-            .expand(B, -1)
-        )
-        full_position_ids = torch.cat([visual_positions, text_positions], dim=1)
-
+        # THE FIX: Pass visual_embeds as encoder_hidden_states.
+        # GPT-2 will automatically route this to the cross-attention layers.
         outputs = self.gpt2(
-            inputs_embeds=combined_embeds,
-            attention_mask=full_attention_mask,
-            position_ids=full_position_ids,
+            inputs_embeds=text_inputs_embeds,
+            attention_mask=attention_mask,
+            encoder_hidden_states=visual_embeds,
+            # encoder_attention_mask defaults to all 1s (which is correct for DINO patches)
         )
 
-        return outputs.logits[:, 256:, :]
+        # NO MORE SLICING ([:, 256:, :]). The sequence length is exactly the text length.
+        return outputs.logits
