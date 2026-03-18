@@ -8,7 +8,6 @@ import os
 from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms as transforms
 import torch.distributed as dist
-from transformers import DynamicCache
 
 
 class Trainer:
@@ -47,19 +46,28 @@ class Trainer:
 
         base_lr = config.lr
 
-        optimizer_grouped_parameters = [
-            {"params": low_lr_params, "lr": base_lr},
-            {"params": high_lr_params, "lr": base_lr * 10},
-        ]
+        # optimizer_grouped_parameters = [
+        #     {"params": low_lr_params, "lr": base_lr},
+        #     {"params": high_lr_params, "lr": base_lr * 10},
+        # ]
 
-        self.optimizer = optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
+        # self.optimizer = optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
+        self.optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.01)
 
         total_steps = config.steps_per_epoch * config.epochs
+        # self.scheduler = optim.lr_scheduler.OneCycleLR(
+        #     self.optimizer,
+        #     max_lr=[base_lr, base_lr * 10],
+        #     total_steps=total_steps,
+        #     pct_start=0.1,
+        #     div_factor=10,
+        #     final_div_factor=100,
+        # )
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=[base_lr, base_lr * 10],
+            max_lr=base_lr,  # Removed the * 10 multiplier
             total_steps=total_steps,
-            pct_start=0.1,
+            pct_start=0.05,  # Quicker warmup
             div_factor=10,
             final_div_factor=100,
         )
@@ -140,7 +148,7 @@ class Trainer:
                     {
                         "train_loss": loss.item(),
                         "lr_gpt": lrs[0],
-                        "lr_vis": lrs[1],
+                        # "lr_vis": lrs[1],
                         "global_step": epoch * self.config.steps_per_epoch + step,
                     }
                 )
@@ -175,7 +183,7 @@ class Trainer:
 
         with torch.no_grad():
             outputs = model_ptr.vision_encoder(pixel_values=images)
-            raw_visual = outputs.last_hidden_state
+            raw_visual = outputs.last_hidden_state[:, 1:, :]  # 256 patches
             visual_embeds = model_ptr.visual_mapper(raw_visual)
 
         input_ids = torch.full(
@@ -185,13 +193,9 @@ class Trainer:
         finished = torch.zeros(B, dtype=torch.bool, device=device)
         past_key_values = None
 
-        # FIX: Initialize the attention mask for the 32 visual tokens + 1 SOS token
-        attention_mask = torch.ones(
-            (B, model_ptr.num_visual_queries + 1), dtype=torch.long, device=device
-        )
-
         while not finished.all():
             with torch.no_grad():
+                # 1. Setup the current token and countdown position
                 if past_key_values is None:
                     new_token_ids = input_ids
                     positions = torch.zeros((B, 1), dtype=torch.long, device=device)
@@ -199,33 +203,31 @@ class Trainer:
                     new_token_ids = input_ids[:, -1:]
                     positions = current_lengths.unsqueeze(1)
 
+                # 2. Get embeddings
                 word_embeds = model_ptr.gpt2.base_model.model.transformer.wte(
                     new_token_ids
                 )
-                wpe = model_ptr.gpt2.base_model.model.transformer.wpe(positions)
                 count_embeds = model_ptr.countdown_emb(positions, target_lengths)
+                text_embeds = word_embeds + count_embeds
 
-                text_embeds = word_embeds + wpe + count_embeds
-
+                # 3. Concatenate visuals only on the very first step
                 if past_key_values is None:
                     inputs_embeds = torch.cat([visual_embeds, text_embeds], dim=1)
                 else:
                     inputs_embeds = text_embeds
 
+                # 4. THE FIX: Strip out the manual attention_mask and position_ids.
+                # Let Hugging Face handle the KV-cache incrementing automatically.
                 outputs = model_ptr.gpt2(
                     inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,  # FIX: Pass the mask!
-                    past_key_values=(
-                        DynamicCache.from_legacy_cache(past_key_values)
-                        if past_key_values is not None
-                        else None
-                    ),
+                    past_key_values=past_key_values,
                     use_cache=True,
                 )
 
                 past_key_values = outputs.past_key_values
                 next_token_logits = outputs.logits[:, -1, :]
 
+                # 5. Apply Repetition Penalty
                 if repetition_penalty != 1.0:
                     for i in range(B):
                         unique_tokens = torch.unique(input_ids[i])
@@ -239,28 +241,22 @@ class Trainer:
                                 selected_logits / repetition_penalty,
                             )
 
+                # 6. Sample the next token
                 next_token_logits = next_token_logits / temperature
                 if top_k > 0:
                     top_k_probs, _ = torch.topk(next_token_logits, top_k)
                     min_val = top_k_probs[:, -1].unsqueeze(-1)
                     next_token_logits[next_token_logits < min_val] = float("-inf")
-
                 probs = torch.softmax(next_token_logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
 
-            next_token = torch.where(
-                finished, torch.full_like(next_token, self.eos_token_id), next_token
-            )
-            input_ids = torch.cat([input_ids, next_token.unsqueeze(1)], dim=1)
-
-            # FIX: Grow the attention mask by 1 for the newly generated token
-            attention_mask = torch.cat(
-                [attention_mask, torch.ones((B, 1), dtype=torch.long, device=device)],
-                dim=1,
-            )
-
-            current_lengths += (~finished).long()
-            finished = current_lengths >= target_lengths
+                # 7. Check completion
+                next_token = torch.where(
+                    finished, torch.full_like(next_token, self.eos_token_id), next_token
+                )
+                input_ids = torch.cat([input_ids, next_token.unsqueeze(1)], dim=1)
+                current_lengths += (~finished).long()
+                finished = current_lengths >= target_lengths
 
         return input_ids[:, 1:]
 

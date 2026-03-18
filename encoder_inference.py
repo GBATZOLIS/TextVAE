@@ -52,14 +52,14 @@ model = PlanningGPT2(config).to(config.device)
 trainer = Trainer(model, train_loader=val_loader, val_loader=val_loader, config=config)
 
 # 5. Load checkpoint
-checkpoint_path = "/home/rg625/mnt/TextVAE/checkpoints/model_epoch_13.pt"
+checkpoint_path = "/home/rg625/mnt/TextVAE/checkpoints/model_epoch_16.pt"
 print(f"\nLoading checkpoint from {checkpoint_path}...")
 trainer.load(checkpoint_path)
 
 # 6. Run visual inference
 print("\nGenerating visualizations...")
 trainer.save_multi_length_visualizations(
-    target_lengths=[50, 125, 200, 300],
+    target_lengths=[50, 100, 150, 256],
     output_dir="multi_length_results",
     num_images=5,
     temperature=0.3,  # 0.7 keeps the English grounded and prevents hallucinations
@@ -77,7 +77,7 @@ evaluator = Evaluator(
 
 # This tests the exact same batches at every target length and plots it
 length_metrics = evaluator.evaluate_multiple_lengths_and_plot(
-    forced_lengths=[50, 125, 200, 300],
+    forced_lengths=[50, 100, 150, 256],
     num_batches=4,  # Adjust this to test more or fewer images
     plot_path="supervisor_forced_length_sweep.png",
 )
