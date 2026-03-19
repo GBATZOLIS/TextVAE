@@ -36,9 +36,7 @@ def build_config_from_args(args) -> DecoderConfig:
 
 def main_worker(local_rank, world_size, args):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = (
-        "12356"  # Changed port to avoid collision if encoder is running
-    )
+    os.environ["MASTER_PORT"] = "12356"  # Avoid collision with encoder
 
     dist.init_process_group(backend="nccl", rank=local_rank, world_size=world_size)
     torch.cuda.set_device(local_rank)
@@ -47,23 +45,25 @@ def main_worker(local_rank, world_size, args):
     config = build_config_from_args(args)
     config.device = torch.device(f"cuda:{local_rank}")
 
+    # Initialize Datasets
     val_ds = StreamingDecoderDataset(config)
     train_ds = StreamingDecoderDataset(config)
 
-    images_to_skip = 500
-    if hasattr(val_ds.dataset, "take"):
-        val_ds.dataset = val_ds.dataset.take(500)
-        train_ds.dataset = train_ds.dataset.skip(images_to_skip)
-    else:
-        val_ds.dataset = val_ds.dataset.select(range(500))
-        train_ds.dataset = train_ds.dataset.select(
-            range(images_to_skip, len(train_ds.dataset))
-        )
+    # --- THE LIST SLICING FIX ---
+    # Reserve the first 500 images exclusively for validation
+    val_ds.dataset = val_ds.dataset[:500]
 
-    if hasattr(train_ds.dataset, "shard"):
-        train_ds.dataset = train_ds.dataset.shard(
-            num_shards=world_size, index=local_rank
-        )
+    images_to_skip = 500
+    if local_rank == 0:
+        print(f"Skipping first {images_to_skip} images for training...")
+
+    # Safely slice the training dataset list
+    safe_skip = min(images_to_skip, len(train_ds.dataset) - 1)
+    train_ds.dataset = train_ds.dataset[safe_skip:]
+
+    if local_rank == 0:
+        print(f"Validation pool: {len(val_ds.dataset)} images")
+        print(f"Training pool: {len(train_ds.dataset)} images")
 
     per_device_batch_size = config.batch_size // world_size
 
@@ -95,9 +95,7 @@ def main_worker(local_rank, world_size, args):
 
         if local_rank == 0:
             print(f"\n--- Epoch {epoch} Evaluation ---")
-            _ = evaluator.compute_metrics(
-                num_batches=2
-            )  # Keep eval batches low to save time
+            _ = evaluator.compute_metrics(num_batches=2)
             print(f"Epoch {epoch} | Loss: {avg_loss:.4f}")
             save_path = os.path.join(config.save_dir, f"decoder_epoch_{epoch+1}.pt")
             trainer.save(save_path, epoch=epoch)

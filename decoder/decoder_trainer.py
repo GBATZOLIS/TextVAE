@@ -61,7 +61,6 @@ class DecoderTrainer:
             with torch.autocast(
                 device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp
             ):
-                # The Decoder module handles the diffusion forward pass
                 loss = self.model(images, input_ids, attention_mask)
 
             self.scaler.scale(loss).backward()
@@ -84,11 +83,18 @@ class DecoderTrainer:
                     }
                 )
 
-                if step > 0 and step % 1000 == 0:
-                    self.log_predictions(f"{epoch}_step_{step}")
-                    self.model.train()
+            # --- DDP FIX: Force all GPUs to wait before logging generations ---
+            if step > 0 and step % 1000 == 0:
+                if self.is_distributed:
+                    dist.barrier()
+                self.log_predictions(f"{epoch}_step_{step}")
+                self.model.train()
 
+        # End of epoch logging
+        if self.is_distributed:
+            dist.barrier()
         self.log_predictions(epoch)
+
         return total_loss / self.config.steps_per_epoch
 
     def log_predictions(self, epoch, num_samples=2):
@@ -117,7 +123,7 @@ class DecoderTrainer:
         wandb_images = []
         for i in range(len(texts_to_generate)):
             prompt = texts_to_generate[i]
-            caption = f"Prompt: {prompt[:200]}..."  # Truncate long prompts for UI
+            caption = f"Prompt: {prompt[:200]}..."
 
             wandb_images.append(wandb.Image(gt_images[i].cpu(), caption="Ground Truth"))
             wandb_images.append(wandb.Image(generated_images[i], caption=caption))

@@ -1,12 +1,10 @@
+import os
+import json
+import random
 import torch
-import itertools
-import unittest.mock
 from torch.utils.data import IterableDataset, get_worker_info
 from torchvision import transforms
-from datasets import load_dataset
 from transformers import T5Tokenizer
-import requests
-from io import BytesIO
 import torch.distributed as dist
 from PIL import Image, ImageFile
 
@@ -18,11 +16,16 @@ class StreamingDecoderDataset(IterableDataset):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.dataset = load_dataset(
-            config.hf_dataset_path, split="train", cache_dir=config.hf_cache_dir
-        )
 
-        # Diffusers VAE expects [-1, 1] normalization, NOT ImageNet stats!
+        # --- HPC LOCAL PATHS ---
+        self.data_path = config.data_path
+        self.image_dir = config.image_dir
+
+        # Load the index completely into RAM
+        with open(self.data_path, "r", encoding="utf-8") as f:
+            self.dataset = [json.loads(line) for line in f]
+
+        # Diffusers VAE expects [-1, 1] normalization
         self.transform = transforms.Compose(
             [
                 transforms.Resize((config.img_size, config.img_size)),
@@ -38,26 +41,30 @@ class StreamingDecoderDataset(IterableDataset):
 
     def _process_item(self, item):
         try:
-            # Safely handle image extraction (same robust logic as encoder)
-            if "image" in item and isinstance(item["image"], Image.Image):
-                image = self._robust_rgb_convert(item["image"])
-            elif "image_url" in item and isinstance(item["image_url"], str):
-                response = requests.get(item["image_url"], timeout=5)
-                image = self._robust_rgb_convert(Image.open(BytesIO(response.content)))
-            else:
-                return None
-
+            # 1. Fast local NVMe image read
+            image_path = os.path.join(self.image_dir, item["local_filename"])
+            raw_image = Image.open(image_path)
+            image = self._robust_rgb_convert(raw_image)
             image_tensor = self.transform(image)
 
-            caption = item.get("text", item.get("caption", ""))
-            if isinstance(caption, list):
-                caption = caption[0]
-            caption = str(caption).strip()
+            # 2. LENGTH STRATIFICATION (Matches Encoder Distribution)
+            choice = random.random()
+            if choice < 0.33:
+                caption = item.get("short", "")
+            elif choice < 0.66:
+                caption = item.get("medium", "")
+            else:
+                caption = item.get("long", "")
 
+            # Fallback
+            if not caption:
+                caption = item.get("original", "")
+
+            caption = str(caption).strip()
             if not caption:
                 return None
 
-            # T5 Tokenization
+            # 3. T5 Tokenization (T5 requires explicit padding to max_length for the DiT)
             encoded = self.tokenizer(
                 caption,
                 padding="max_length",
@@ -66,7 +73,6 @@ class StreamingDecoderDataset(IterableDataset):
                 return_tensors="pt",
             )
 
-            # Extract raw string, input_ids, and attention mask
             return (
                 image_tensor,
                 caption,
@@ -91,25 +97,17 @@ class StreamingDecoderDataset(IterableDataset):
         global_rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        with unittest.mock.patch("torch.utils.data.get_worker_info", return_value=None):
-            base_iterator = iter(self.dataset)
-            if worker_info is not None:
-                total_workers = world_size * worker_info.num_workers
-                global_worker_id = (
-                    global_rank * worker_info.num_workers
-                ) + worker_info.id
-                base_iterator = itertools.islice(
-                    base_iterator, global_worker_id, None, total_workers
-                )
-            else:
-                base_iterator = itertools.islice(
-                    base_iterator, global_rank, None, world_size
-                )
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        worker_id = worker_info.id if worker_info is not None else 0
 
-            for item in base_iterator:
-                processed = self._process_item(item)
-                if processed is not None:
-                    yield processed
+        # Safely shard the local list across all workers and GPUs
+        total_streams = world_size * num_workers
+        global_stream_id = (global_rank * num_workers) + worker_id
+
+        for i in range(global_stream_id, len(self.dataset), total_streams):
+            processed = self._process_item(self.dataset[i])
+            if processed is not None:
+                yield processed
 
 
 def collate_fn(batch):

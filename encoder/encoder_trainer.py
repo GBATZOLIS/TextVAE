@@ -116,7 +116,14 @@ class Trainer:
                     }
                 )
 
-                if step > 0 and step % 1000 == 0:
+                if step > 0 and step % 2500 == 0:
+                    self.log_predictions(f"{epoch}_step_{step}")
+                    self.model.train()
+
+            # Force all GPUs to wait here if it's a logging step
+            if step > 0 and step % 2500 == 0:
+                if self.is_distributed:
+                    dist.barrier()
                     self.log_predictions(f"{epoch}_step_{step}")
                     self.model.train()
 
