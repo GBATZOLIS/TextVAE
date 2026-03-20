@@ -40,7 +40,7 @@ class SemanticDecoder(nn.Module):
 
         print("Loading PixArt DiT and applying LoRA...")
         base_transformer = PixArtTransformer2DModel.from_pretrained(
-            config.model_id, subfolder="transformer"
+            config.model_id, subfolder="transformer", torch_dtype=torch.float16
         )
 
         # Apply LoRA to the attention layers of the DiT
@@ -96,8 +96,13 @@ class SemanticDecoder(nn.Module):
             added_cond_kwargs=added_cond_kwargs,
         ).sample
 
+        # PixArt outputs 8 channels (4 for noise, 4 for variance).
+        # We only want to calculate the MSE loss on the first 4 noise channels.
+        if model_pred.shape[1] == noise.shape[1] * 2:
+            model_pred, _ = torch.chunk(model_pred, 2, dim=1)
+
         # 7. Compute Loss
-        loss = nn.functional.mse_loss(
+        loss = torch.nn.functional.mse_loss(
             model_pred.float(), noise.float(), reduction="mean"
         )
         return loss

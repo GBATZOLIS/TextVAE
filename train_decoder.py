@@ -15,7 +15,9 @@ from decoder.decoder_trainer import DecoderTrainer
 from decoder.decoder_eval import DecoderEvaluator
 
 import torch.multiprocessing
+import warnings
 
+warnings.filterwarnings("ignore", module="pydantic")
 torch.multiprocessing.set_sharing_strategy("file_system")
 torch.set_float32_matmul_precision("high")
 

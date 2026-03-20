@@ -8,6 +8,7 @@ from transformers import T5Tokenizer
 import torch.distributed as dist
 from PIL import Image, ImageFile
 
+# FIX: Prevent libjpeg/libpng from sending SIGABRT to the worker
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None
 
@@ -35,6 +36,7 @@ class StreamingDecoderDataset(IterableDataset):
             ]
         )
 
+        # Load the T5 Tokenizer
         self.tokenizer = T5Tokenizer.from_pretrained(
             config.model_id, subfolder="tokenizer"
         )
@@ -47,7 +49,7 @@ class StreamingDecoderDataset(IterableDataset):
             image = self._robust_rgb_convert(raw_image)
             image_tensor = self.transform(image)
 
-            # 2. LENGTH STRATIFICATION (Matches Encoder Distribution)
+            # 2. LENGTH STRATIFICATION
             choice = random.random()
             if choice < 0.33:
                 caption = item.get("short", "")
@@ -64,12 +66,10 @@ class StreamingDecoderDataset(IterableDataset):
             if not caption:
                 return None
 
-            # 3. T5 Tokenization (T5 requires explicit padding to max_length for the DiT)
+            # 3. T5 Tokenization (Infinite Length - No Truncation or Padding)
             encoded = self.tokenizer(
                 caption,
-                padding="max_length",
-                truncation=True,
-                max_length=self.config.max_len,
+                truncation=False,  # The guillotine is completely removed
                 return_tensors="pt",
             )
 
@@ -84,6 +84,7 @@ class StreamingDecoderDataset(IterableDataset):
             return None
 
     def _robust_rgb_convert(self, image):
+        """Safely converts any image format to RGB, dropping alpha channels if present."""
         if image.mode in ("RGBA", "LA") or (
             image.mode == "P" and "transparency" in image.info
         ):
@@ -113,6 +114,15 @@ class StreamingDecoderDataset(IterableDataset):
 def collate_fn(batch):
     images, captions, input_ids_list, attn_masks_list = zip(*batch)
     images = torch.stack(images)
-    input_ids = torch.stack(input_ids_list)
-    attention_masks = torch.stack(attn_masks_list)
+
+    # --- THE FIX: Dynamic Batch Padding ---
+    # Pads the text tensors to match whatever the longest caption is in THIS specific batch
+    # T5 uses 0 as its padding token ID
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        input_ids_list, batch_first=True, padding_value=0
+    )
+    attention_masks = torch.nn.utils.rnn.pad_sequence(
+        attn_masks_list, batch_first=True, padding_value=0
+    )
+
     return images, list(captions), input_ids, attention_masks

@@ -3,6 +3,8 @@ import torch.optim as optim
 import wandb
 from tqdm import tqdm
 import torch.distributed as dist
+from PIL import Image
+import torchvision.transforms as transforms
 
 
 class DecoderTrainer:
@@ -32,7 +34,7 @@ class DecoderTrainer:
         )
 
         if self.is_main_process and config.use_wandb:
-            wandb.init(project="planning-autoencoder-decoder", config=vars(config))
+            wandb.init(project="planning-autoencoder", config=vars(config))
 
     def train_epoch(self, epoch):
         self.model.train()
@@ -97,7 +99,7 @@ class DecoderTrainer:
 
         return total_loss / self.config.steps_per_epoch
 
-    def log_predictions(self, epoch, num_samples=2):
+    def log_predictions(self, epoch, num_samples=4):
         if not self.is_main_process or not self.config.use_wandb:
             return
 
@@ -107,28 +109,41 @@ class DecoderTrainer:
         except StopIteration:
             return
 
+        # Grab a few samples so you can see a mix of short, medium, and long text
         texts_to_generate = captions[:num_samples]
         gt_images = images[:num_samples]
 
-        # Convert GT [-1, 1] images to [0, 1] for logging
+        # Convert GT [-1, 1] tensors back to standard [0, 1] image formatting
         gt_images = (gt_images + 1.0) / 2.0
 
-        # Generate images from text
-        generated_images = (
-            self.model.module.generate(texts_to_generate)
-            if hasattr(self.model, "module")
-            else self.model.generate(texts_to_generate)
-        )
+        # Generate images from the text
+        model_ptr = self.model.module if hasattr(self.model, "module") else self.model
+        generated_images = model_ptr.generate(texts_to_generate)
 
         wandb_images = []
+        to_pil = transforms.ToPILImage()
+
         for i in range(len(texts_to_generate)):
-            prompt = texts_to_generate[i]
-            caption = f"Prompt: {prompt[:200]}..."
+            full_prompt = texts_to_generate[i]
 
-            wandb_images.append(wandb.Image(gt_images[i].cpu(), caption="Ground Truth"))
-            wandb_images.append(wandb.Image(generated_images[i], caption=caption))
+            # 1. Convert the ground truth tensor into a standard PIL Image
+            gt_pil = to_pil(gt_images[i].cpu())
+            gen_pil = generated_images[i]
 
-        wandb.log({"Reconstructions": wandb_images, "epoch": epoch})
+            # 2. Create a blank canvas exactly twice as wide as the images
+            w, h = gt_pil.size
+            combined_img = Image.new("RGB", (w * 2, h))
+
+            # 3. Paste them side-by-side
+            combined_img.paste(gt_pil, (0, 0))  # Real on the Left
+            combined_img.paste(gen_pil, (w, 0))  # Generated on the Right
+
+            # 4. Attach the full, untruncated string to the combined image
+            display_caption = f"Left: Real | Right: Generated\n\nPrompt: {full_prompt}"
+
+            wandb_images.append(wandb.Image(combined_img, caption=display_caption))
+
+        wandb.log({"Evaluation Samples": wandb_images, "epoch": epoch})
 
     def save(self, path, epoch):
         model_to_save = (
