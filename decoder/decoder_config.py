@@ -6,22 +6,23 @@ from dataclasses import dataclass
 @dataclass
 class DecoderConfig:
     # --- Model & Local HPC Data Paths ---
-    model_id: str = "PixArt-alpha/PixArt-XL-2-512x512"  # Base DiT model
+    # model_id: str = "PixArt-alpha/PixArt-Sigma-XL-2-512x512"
+    model_id: str = "PixArt-alpha/PixArt-XL-2-512x512"
     data_path: str = "/home/rg625/datasets/pixmo_ready.jsonl"
     image_dir: str = "/home/rg625/datasets/pixmo_images"
 
     # --- Resolution & Sequence Setup ---
-    img_size: int = 512  # Diffusers DiTs usually train well at 512 or 256
-    max_len: int = 300  # Extended length for T5-XXL
+    img_size: int = 512
+    max_len: int = 384  # Enforced massive sequence length!
 
     # --- Checkpoint / Logging ---
     save_dir: str = "/home/rg625/mnt/TextVAE/decoder_checkpoints"
     use_wandb: bool = True
 
-    # --- Training (DiTs need lower learning rates) ---
-    batch_size: int = 4  # Keep batch size low due to T5 and VAE memory overhead
-    lr: float = 1e-4
-    epochs: int = 50
+    # --- Training ---
+    batch_size: int = 1
+    lr: float = 2e-4
+    epochs: int = 100
     steps_per_epoch: int = 5000
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 

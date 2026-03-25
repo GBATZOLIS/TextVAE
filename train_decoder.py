@@ -7,14 +7,14 @@ from torch.utils.data import DataLoader
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 from decoder.decoder_config import DecoderConfig
 from decoder_dataset import StreamingDecoderDataset, collate_fn
-from decoder.pretrained_decoder import SemanticDecoder
+from decoder.flux_decoder import FluxSemanticDecoder
 from decoder.decoder_trainer import DecoderTrainer
 from decoder.decoder_eval import DecoderEvaluator
 
-import torch.multiprocessing
 import warnings
 
 warnings.filterwarnings("ignore", module="pydantic")
@@ -38,7 +38,7 @@ def build_config_from_args(args) -> DecoderConfig:
 
 def main_worker(local_rank, world_size, args):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "12356"  # Avoid collision with encoder
+    os.environ["MASTER_PORT"] = "12356"
 
     dist.init_process_group(backend="nccl", rank=local_rank, world_size=world_size)
     torch.cuda.set_device(local_rank)
@@ -47,58 +47,80 @@ def main_worker(local_rank, world_size, args):
     config = build_config_from_args(args)
     config.device = torch.device(f"cuda:{local_rank}")
 
-    # Initialize Datasets
-    val_ds = StreamingDecoderDataset(config)
-    train_ds = StreamingDecoderDataset(config)
+    print(f"[{local_rank}] Loading Map Datasets...")
 
-    # --- THE LIST SLICING FIX ---
-    # Reserve the first 500 images exclusively for validation
+    # --- NEW: Instantiate Train and Val separately with specific splits ---
+    train_ds = StreamingDecoderDataset(config, split="train")
+    val_ds = StreamingDecoderDataset(config, split="val")
+
+    # Slice the underlying lists safely directly on the dataset object
+    # (Removes the need for the Subset wrapper)
     val_ds.dataset = val_ds.dataset[:500]
-
-    images_to_skip = 500
-    if local_rank == 0:
-        print(f"Skipping first {images_to_skip} images for training...")
-
-    # Safely slice the training dataset list
-    safe_skip = min(images_to_skip, len(train_ds.dataset) - 1)
-    train_ds.dataset = train_ds.dataset[safe_skip:]
+    train_ds.dataset = train_ds.dataset[500:]
 
     if local_rank == 0:
         print(f"Validation pool: {len(val_ds.dataset)} images")
         print(f"Training pool: {len(train_ds.dataset)} images")
 
-    per_device_batch_size = config.batch_size // world_size
+    per_device_batch_size = (
+        config.batch_size // world_size
+        if config.batch_size >= world_size
+        else config.batch_size
+    )
+
+    train_sampler = DistributedSampler(
+        train_ds, num_replicas=world_size, rank=local_rank, shuffle=True, seed=args.seed
+    )
 
     train_loader = DataLoader(
         train_ds,
         batch_size=per_device_batch_size,
+        sampler=train_sampler,
         collate_fn=collate_fn,
         num_workers=config.num_workers,
         pin_memory=True,
-        prefetch_factor=config.prefetch_factor,
     )
 
     val_loader = DataLoader(
         val_ds,
         batch_size=per_device_batch_size,
+        shuffle=False,
         collate_fn=collate_fn,
         num_workers=config.num_workers,
         pin_memory=True,
     )
 
-    model = SemanticDecoder(config).to(local_rank)
+    # model = SemanticDecoder(config).to(local_rank)
+    model = FluxSemanticDecoder(config).to(local_rank)
+
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     trainer = DecoderTrainer(model, train_loader, val_loader, config)
     evaluator = DecoderEvaluator(model, val_loader, config.device)
 
     for epoch in range(config.epochs):
+        train_sampler.set_epoch(epoch)
+
         avg_loss = trainer.train_epoch(epoch)
 
         if local_rank == 0:
-            print(f"\n--- Epoch {epoch} Evaluation ---")
-            _ = evaluator.compute_metrics(num_batches=2)
-            print(f"Epoch {epoch} | Loss: {avg_loss:.4f}")
+            print(f"\n--- Epoch {epoch} Complete ---")
+            print(f"Loss: {avg_loss:.4f}")
+
+            print("Running End-of-Epoch Evaluation Sweep...")
+            report = evaluator.compute_metrics(num_batches=2)
+
+            if config.use_wandb:
+                import wandb
+
+                wandb.log(
+                    {
+                        "Epoch_CLIP_Score": report.get("CLIP_Score", 0),
+                        "Epoch_FID_Score": report.get("FID_Score", 0),
+                        "epoch": epoch,
+                    }
+                )
+
             save_path = os.path.join(config.save_dir, f"decoder_epoch_{epoch+1}.pt")
             trainer.save(save_path, epoch=epoch)
 
