@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "textvae"
+version = "0.1.0"
+description = "VAE with interpretable textual latents and a diffusion decoder"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "torchvision",
+    "transformers>=4.40",
+    "diffusers>=0.27",
+    "accelerate>=0.28",
+    "peft>=0.10",
+    "pyyaml",
+    "pillow",
+    "numpy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+logging = ["tensorboard", "wandb"]
+data = ["datasets>=2.18", "webdataset"]
+dev = ["pytest", "mypy", "ruff", "black"]
+
+[tool.setuptools]
+packages = ["project", "project.models", "project.datasets", "project.training", "project.utils"]
+package-dir = {"project" = "."}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+filterwarnings = ["ignore::DeprecationWarning", "ignore::FutureWarning"]
+markers = [
+    "slow: tests that build non-trivial models or need pretrained weights",
+    "gpu: tests that require CUDA",
+]
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100

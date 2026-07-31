@@ -1,0 +1,106 @@
+# Tiny, fully offline, CPU-runnable configuration.
+#
+# Every sub-model is randomly initialised at a toy size (no hub downloads), so this config
+# exercises the entire pipeline — rollout, KL, diffusion loss, logging, checkpointing —
+# in seconds. Use it to smoke-test code changes:
+#
+#   python -m project.scripts.train --config project/configs/debug.yaml
+
+model:
+  encoder:
+    latent_length: 8
+    projector_layers: 2
+    projector_dropout: 0.0
+    vision:
+      name: tiny-vit
+      backend: vit
+      pretrained: false
+      freeze_backbone: false
+      image_size: 32
+      overrides:
+        hidden_size: 64
+        num_hidden_layers: 2
+        num_attention_heads: 2
+        intermediate_size: 128
+        patch_size: 8
+    text_decoder:
+      backend: gpt2
+      pretrained: false
+      num_layers: 2
+      d_model: 64
+      num_heads: 2
+      max_position_embeddings: 64
+      dropout: 0.0
+
+  prior:
+    name: tiny-gpt2
+    pretrained: false
+    overrides:
+      vocab_size: 256
+      n_embd: 64
+      n_layer: 2
+      n_head: 2
+      n_positions: 64
+
+  gumbel:
+    schedule: linear
+    tau_start: 1.0
+    tau_end: 0.5
+    anneal_steps: 20
+    hard: true
+    straight_through: true
+    eval_temperature: 0.1
+
+  decoder:
+    image_space: pixel
+    context_projection: linear
+    num_train_timesteps: 100
+    num_inference_steps: 4
+    unet:
+      pretrained: false
+      sample_size: 32
+      in_channels: 3
+      out_channels: 3
+      block_out_channels: [32, 64]
+      layers_per_block: 1
+      down_block_types: [DownBlock2D, CrossAttnDownBlock2D]
+      up_block_types: [CrossAttnUpBlock2D, UpBlock2D]
+      cross_attention_dim: 64
+      attention_head_dim: 8
+      norm_num_groups: 8
+
+loss:
+  beta: 1.0
+  beta_schedule: constant
+  kl_estimator: relaxed
+  kl_reduction: sum
+
+data:
+  dataset: synthetic
+  image_size: 32
+  batch_size: 2
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+  max_samples: 16
+
+optim:
+  lr: 1.0e-3
+  scheduler: constant
+  warmup_steps: 0
+  grad_accum_steps: 1
+
+train:
+  output_dir: runs/debug
+  run_name: debug
+  max_steps: 4
+  mixed_precision: "no"
+  log_every: 1
+  val_every: 2
+  sample_every: 2
+  ckpt_every: 2
+  val_max_batches: 2
+  num_log_samples: 2
+  tracker:
+    tensorboard: false
+    wandb: false

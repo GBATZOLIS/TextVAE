@@ -1,103 +1,65 @@
-import os
-import requests
-import zipfile
 import json
-from tqdm import tqdm
+from datasets import load_dataset
+from vllm import LLM, SamplingParams
 
-# Configuration
-DATA_DIR = "data"
-IMG_DIR = os.path.join(DATA_DIR, "images")
-URL_IMAGES = "http://images.cocodataset.org/zips/val2017.zip"
-URL_ANNOTATIONS = (
-    "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
-)
+# --- CONFIGURATION ---
+# Qwen2.5-7B is incredibly smart, natively supports JSON-like structuring, and easily fits on a 4090
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+DATASET_NAME = "allenai/PixMo-Cap"
+OUTPUT_FILE = "/home/rg625/datasets/pixmo_stratified.jsonl"
+HF_CACHE_DIR = "/home/rg625/datasets/hf_cache"
 
-
-def download_file(url, save_path):
-    if os.path.exists(save_path):
-        print(f"{save_path} already exists. Skipping download.")
-        return
-
-    print(f"Downloading {url}...")
-    response = requests.get(url, stream=True)
-    total_size = int(response.headers.get("content-length", 0))
-
-    with open(save_path, "wb") as f, tqdm(
-        desc=save_path,
-        total=total_size,
-        unit="iB",
-        unit_scale=True,
-        unit_divisor=1024,
-    ) as bar:
-        for data in response.iter_content(chunk_size=1024):
-            size = f.write(data)
-            bar.update(size)
-
-
-def extract_zip(zip_path, extract_to):
-    print(f"Extracting {zip_path}...")
-    with zipfile.ZipFile(zip_path, "r") as zip_ref:
-        zip_ref.extractall(extract_to)
-
-
-def process_coco_annotations(anno_path, output_path):
-    print("Processing annotations to match Encoder format...")
-
-    with open(anno_path, "r") as f:
-        coco = json.load(f)
-
-    # Create a map of image_id -> file_name
-    img_map = {img["id"]: img["file_name"] for img in coco["images"]}
-
-    # Format: [{"file_name": "...", "caption": "..."}]
-    formatted_data = []
-
-    for anno in coco["annotations"]:
-        img_id = anno["image_id"]
-        caption = anno["caption"]
-
-        if img_id in img_map:
-            formatted_data.append(
-                {
-                    "file_name": os.path.join(
-                        "val2017", img_map[img_id]
-                    ),  # Ensure subdirectory matches extract
-                    "caption": caption,
-                }
-            )
-
-    with open(output_path, "w") as f:
-        json.dump(formatted_data, f, indent=2)
-
-    print(f"Saved {len(formatted_data)} pairs to {output_path}")
+SYSTEM_PROMPT = """Rewrite the following image caption into three lengths.
+Return ONLY a valid JSON object with keys: "short" (5-10 words), "medium" (40-60 words), and "long" (the original details)."""
 
 
 def main():
-    os.makedirs(DATA_DIR, exist_ok=True)
+    print("Loading dataset...")
+    dataset = load_dataset(DATASET_NAME, split="train", cache_dir=HF_CACHE_DIR)
 
-    # 1. Download Images
-    img_zip = os.path.join(DATA_DIR, "val2017.zip")
-    download_file(URL_IMAGES, img_zip)
+    # Extract the original captions
+    original_captions = [row.get("text", row.get("caption", "")) for row in dataset]
+    image_urls = [row.get("image_url", row.get("url", "")) for row in dataset]
 
-    # 2. Download Annotations
-    anno_zip = os.path.join(DATA_DIR, "annotations.zip")
-    download_file(URL_ANNOTATIONS, anno_zip)
+    # Format the prompts for the model
+    formatted_prompts = [
+        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{cap}<|im_end|>\n<|im_start|>assistant\n{{"
+        for cap in original_captions
+        if cap
+    ]
 
-    # 3. Extract
-    extract_zip(img_zip, IMG_DIR)  # Extracts to data/images/val2017
-    extract_zip(anno_zip, DATA_DIR)  # Extracts to data/annotations
+    print(f"Loading {MODEL_NAME} into VRAM...")
+    # Initialize vLLM (this allocates your GPU memory)
+    llm = LLM(model=MODEL_NAME, download_dir=HF_CACHE_DIR, max_model_len=4096)
+    sampling_params = SamplingParams(
+        temperature=0.7, max_tokens=500, stop=["<|im_end|>"]
+    )
 
-    # 4. Process JSON
-    raw_anno = os.path.join(DATA_DIR, "annotations", "captions_val2017.json")
-    final_json = os.path.join(DATA_DIR, "captions.json")
+    print("Generating augmented captions in batches...")
+    # vLLM handles the massive parallel batching automatically
+    outputs = llm.generate(formatted_prompts, sampling_params)
 
-    process_coco_annotations(raw_anno, final_json)
+    print(f"Writing results to {OUTPUT_FILE}...")
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        for i, output in enumerate(outputs):
+            try:
+                # We forced the prompt to start with '{', so we add it back
+                generated_text = "{" + output.outputs[0].text.strip()
+                augmented_data = json.loads(generated_text)
 
-    print("\n--- Setup Complete ---")
-    print(f"Images located in: {os.path.join(IMG_DIR, 'val2017')}")
-    print(f"JSON located at:   {final_json}")
-    print("\nYou can now run training with:")
-    print(f"python train_encoder.py --json_path {final_json} --img_dir {IMG_DIR}")
+                new_row = {
+                    "image_url": image_urls[i],
+                    "original": original_captions[i],
+                    "short": augmented_data.get("short", ""),
+                    "medium": augmented_data.get("medium", ""),
+                    "long": augmented_data.get("long", original_captions[i]),
+                }
+                f.write(json.dumps(new_row) + "\n")
+            except json.JSONDecodeError:
+                # Skip rows where the model failed to output perfect JSON
+                continue
+
+    print("Done! You now have a free, locally augmented dataset.")
 
 
 if __name__ == "__main__":

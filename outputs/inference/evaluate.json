@@ -1,0 +1,22 @@
+{
+  "loss": 0.10151006281375885,
+  "diffusion_loss": 0.033032732022305326,
+  "kl": 6.847733084360758,
+  "kl_raw": 6.847733084360758,
+  "kl_per_token": 0.2139916588862737,
+  "log_q": -48.361857096354164,
+  "log_p": -55.209591166178384,
+  "prior_nll_per_token": 1.7252996206283568,
+  "prior_perplexity": 5.614771874745687,
+  "posterior_entropy": 3.7226182142893474,
+  "latent_unique_frac": 0.7669270833333334,
+  "temperature": 0.10000000000000002,
+  "beta": 0.01,
+  "batches": 15,
+  "latent_length": 32,
+  "kl_bits": 9.879190562138552,
+  "diffusion_loss_matched_latent": 0.032491157700618105,
+  "diffusion_loss_mismatched_latent": 0.03249105885624885,
+  "latent_usage": -9.88443692520602e-08,
+  "latent_usage_relative": -3.0421928994601443e-06
+}

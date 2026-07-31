@@ -23,6 +23,9 @@ venv/
 *.egg-info/
 *.egg
 .Python
+*.ini
+*.md
+*.txt
 
 # ------------------------
 # Datasets & Temp Files
@@ -102,3 +105,8 @@ wandb-summary.json
 *.tmp
 *.bak
 *.swp
+
+# ------------------------
+# Tests
+# ------------------------
+project/tests/
